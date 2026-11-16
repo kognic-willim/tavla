@@ -1,7 +1,7 @@
 import asyncio
 import json
 import re
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -27,6 +27,16 @@ PROJECTS = {
     "me": [item("acme/infra", 11, "Personal todo", "Todo"), item("acme/infra", 12, "Finished thing", "Done")],
     "extra": [],
 }
+
+
+def closed_item(repo, number, title, days_ago):
+    closed_at = (datetime.now(UTC) - timedelta(days=days_ago)).isoformat()
+    return {"content": {"__typename": "Issue", "number": number, "title": title, "url": f"https://github.com/{repo}/issues/{number}", "closedAt": closed_at, "repository": {"nameWithOwner": repo}}}
+
+
+# The backlog project's closed items: GitHub filters on the update date only, so one closed before the window can come back.
+CLOSED_PROJECTS = {"me": [closed_item("me/todo", 5, "Shipped report", 5), closed_item("me/todo", 4, "Ancient chore", 45)]}
+CLOSED = {"acme/infra#20", "acme/infra#31", "me/todo#5", "me/todo#4"}
 GRAPHQL_CALLS: list[str] = []
 STATUS_SETS: list[dict] = []
 
@@ -41,6 +51,11 @@ def fake_run(argv, timeout=60, cwd=None):
                 {"kind": "interactive", "sessionId": "eeee5555-0000-0000", "name": "side chat", "status": "idle", "cwd": "/w", "startedAt": 1},
             ]
         )
+    if cmd.startswith("gh search issues") and "closed" in argv:
+        GRAPHQL_CALLS.append("search closed")
+        assert argv[argv.index("--closed") + 1] == f">={(datetime.now(UTC) - timedelta(days=30)).date()}"
+        closed_at = (datetime.now(UTC) - timedelta(days=2)).isoformat()
+        return json.dumps([{"repository": {"nameWithOwner": "acme/infra"}, "number": 20, "title": "Rotated the key", "url": "https://github.com/acme/infra/issues/20", "closedAt": closed_at}])
     if cmd.startswith("gh search issues"):
         GRAPHQL_CALLS.append("search")  # gh search spends the GraphQL budget too
         return json.dumps([{"repository": {"nameWithOwner": "acme/infra"}, "number": 9, "title": "Assigned but untouched", "url": "https://github.com/acme/infra/issues/9", "updatedAt": NOW}])
@@ -61,6 +76,11 @@ def fake_graphql(query, variables=None):
     if 'field(name: "Status")' in query:
         options = [{"id": "opt-todo", "name": "Todo"}, {"id": "opt-progress", "name": "In progress"}]
         return {"data": {"repositoryOwner": {"projectV2": {"id": f"PVT_{variables['owner']}", "field": {"id": "PVTSSF_status", "options": options}}}}}
+    if "closedAt" in query and "projectV2" in query:
+        GRAPHQL_CALLS.append(f"closed project {variables['owner']}")
+        assert variables["filter"].startswith("is:closed is:issue updated:>=")
+        page = {"pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": CLOSED_PROJECTS[variables["owner"]]}
+        return {"data": {"repositoryOwner": {"projectV2": {"items": page}}}}
     if "projectV2" in query:
         GRAPHQL_CALLS.append(f"project {variables['owner']}")
         page = {"pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": PROJECTS[variables["owner"]]}
@@ -72,7 +92,7 @@ def fake_graphql(query, variables=None):
         def issue(n, t, r=f"{owner}/{repo}"):
             rich = n == 7
             return {
-                "__typename": "Issue", "number": n, "title": t, "body": "Fails **twice** a day." if rich else "", "url": f"https://github.com/{r}/issues/{n}", "state": "OPEN", "updatedAt": NOW,
+                "__typename": "Issue", "number": n, "title": t, "body": "Fails **twice** a day." if rich else "", "url": f"https://github.com/{r}/issues/{n}", "state": "CLOSED" if f"{r}#{n}" in CLOSED else "OPEN", "updatedAt": NOW,
                 "repository": {"nameWithOwner": r},
                 "labels": {"nodes": [{"name": "bug [p1]", "color": "d73a4a"}] if rich else []},
                 "subIssuesSummary": {"total": 3 if rich else 0, "completed": 1 if rich else 0},
@@ -120,6 +140,7 @@ def test_routine_refresh_reads_github_metadata_from_cache():
     core.build_board()
     first = list(GRAPHQL_CALLS)
     assert first.count("refs") == 1 and {"search", "project team", "project me", "project extra"} <= set(first)
+    assert first.count("search closed") == 1 and [c for c in first if c.startswith("closed project")] == ["closed project me"]  # backlog projects only
     GRAPHQL_CALLS.clear()
     core.build_board()
     assert GRAPHQL_CALLS == []  # search, projects and issue metadata all served from cache
@@ -131,7 +152,7 @@ def test_project_lists_ask_github_for_open_issues_only(monkeypatch):
     queries = []
     monkeypatch.setattr(core, "graphql", lambda query, variables=None: queries.append(query) or fake_graphql(query, variables))
     core.build_board()
-    project_queries = [q for q in queries if "projectV2" in q]
+    project_queries = [q for q in queries if "fieldValueByName" in q]
     assert len(project_queries) == 3 and all('query: "is:open is:issue"' in q for q in project_queries)
 
 
@@ -919,7 +940,7 @@ def test_tui_slash_filters_board_and_list_then_enter_selects_and_esc_clears():
             await pilot.pause()
             assert keys("todo") == ["card:acme/infra#11"] and keys("blocked") == [] and keys("unlinked") == []
             assert str(app.query_one("#count-todo").content) == "1"
-            assert "1 of 4 issues" in str(app.query_one("#status").content)
+            assert "1 of 6 issues" in str(app.query_one("#status").content)  # the two recently closed ones count: the filter reaches them
 
             await pilot.press("enter")
             await pilot.pause()
@@ -937,6 +958,66 @@ def test_tui_slash_filters_board_and_list_then_enter_selects_and_esc_clears():
             await pilot.press("v")
             await pilot.pause()
             assert keys("todo") == all_todo
+
+    asyncio.run(scenario())
+
+
+def test_recently_closed_issues_are_search_only_cards_off_the_board():
+    board = core.build_board()
+    cards = {c["key"]: c for c in board["cards"]}
+    # Assigned to me, or in a backlog project; one closed before the 30 days is left out.
+    assert {k for k, c in cards.items() if c["searchOnly"]} == {"acme/infra#20", "me/todo#5"}
+    rotated = cards["acme/infra#20"]
+    assert (rotated["isOpen"], rotated["status"], rotated["statusColumn"], rotated["sessions"]) == (False, "Closed", "done", [])
+    assert core.matches(rotated, "rotated key") and core.matches(cards["me/todo#5"], "todo#5 closed")
+    text = core.summary(board, "status")
+    assert "Rotated the key" not in text and "Shipped report" not in text and "## Done (0)" in text
+
+
+def test_finished_issue_with_only_an_old_session_is_search_only(tmp_path):
+    old = (datetime.now(UTC) - timedelta(days=10)).isoformat()
+    (tmp_path / "jobs" / "ffff6666").mkdir()
+    (tmp_path / "jobs" / "ffff6666" / "state.json").write_text(json.dumps({"name": "tidy logs", "state": "done", "intent": "acme/infra#31 tidy", "updatedAt": old}))
+    board = core.build_board()
+    card = next(c for c in board["cards"] if c["key"] == "acme/infra#31")
+    assert card["searchOnly"] and [s["id"] for s in card["sessions"]] == ["ffff6666"]
+    assert all(s["id"] != "ffff6666" for s in board["unlinked"])
+
+
+def test_tui_search_finds_recently_closed_issues_and_starts_a_session_on_one(monkeypatch):
+    from tavla import tui
+
+    started = []
+    monkeypatch.setattr(core, "new_session", lambda target, prompt="", title="": started.append(target) or "dddd4444")
+
+    async def scenario():
+        app = tui.BoardApp()
+        async with app.run_test(size=(190, 45)) as pilot:
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+
+            def keys(column):
+                return [app.item_key(it) for it in app.query_one(f"#col-{column}").children]
+
+            assert keys("done") == [] and str(app.query_one("#count-done").content) == "0"
+            await pilot.press("slash", *"rotated")
+            await pilot.pause()
+            assert keys("done") == ["card:acme/infra#20"] and keys("todo") == []
+            await pilot.press("enter")
+            await pilot.pause()
+            assert app.current["key"] == "acme/infra#20"
+
+            await pilot.press("n")
+            await pilot.pause()
+            assert not app.screen.query("#to-progress")  # a closed issue has no status to move
+            await pilot.press("enter")
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            assert started == ["https://github.com/acme/infra/issues/20"]
+
+            await pilot.press("slash", "escape")
+            await pilot.pause()
+            assert keys("done") == []
 
     asyncio.run(scenario())
 

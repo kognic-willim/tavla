@@ -33,12 +33,21 @@ THEME = "tavla"
 PROJECT_TTL_S = 300
 ASSIGNED_TTL_S = 300  # open issues assigned to me
 META_TTL_S = 600  # issue/PR metadata: labels, sub-issues, linked PRs, open state
+CLOSED_TTL_S = 900  # recently closed issues, which only a search shows
+CLOSED_DAYS = 30
 PROJECT_QUERY = """
 query($owner: String!, $number: Int!, $cursor: String) {
   repositoryOwner(login: $owner) { ... on ProjectV2Owner { projectV2(number: $number) {
     items(first: 100, after: $cursor, query: "is:open is:issue") { pageInfo { hasNextPage endCursor }
       nodes { id status: fieldValueByName(name: "Status") { ... on ProjectV2ItemFieldSingleSelectValue { name } }
         content { __typename ... on Issue { number title url repository { nameWithOwner } } } } } } } }
+}
+"""
+CLOSED_PROJECT_QUERY = """
+query($owner: String!, $number: Int!, $filter: String!, $cursor: String) {
+  repositoryOwner(login: $owner) { ... on ProjectV2Owner { projectV2(number: $number) {
+    items(first: 100, after: $cursor, query: $filter) { pageInfo { hasNextPage endCursor }
+      nodes { content { __typename ... on Issue { number title url closedAt repository { nameWithOwner } } } } } } } }
 }
 """
 STATUS_FIELD_QUERY = """
@@ -357,6 +366,52 @@ def load_assigned(force: bool, errors: list[str], offline: bool = False) -> list
     return items
 
 
+def load_closed(force: bool, errors: list[str], offline: bool = False) -> list[dict]:
+    """Issues closed in the last CLOSED_DAYS days that are assigned to me or sit in a backlog project,
+    cached for CLOSED_TTL_S: one search and one page per backlog project, fetched in parallel.
+    Offline, or when GitHub errs, the last answer is used whatever its age."""
+    cached, fresh = read_cache("closed-cache.json", CLOSED_TTL_S, force, offline)
+    if fresh or offline:
+        return cached or []
+    since = time.strftime("%Y-%m-%d", time.gmtime(time.time() - CLOSED_DAYS * 86_400))
+
+    def assigned() -> list[dict]:
+        fields = "repository,number,title,url,closedAt"
+        rows = json.loads(run(["gh", "search", "issues", "--assignee", "@me", "--state", "closed", "--closed", f">={since}", "--sort", "updated", "--limit", "100", "--json", fields]))
+        return [{"key": f"{r['repository']['nameWithOwner']}#{r['number']}".lower(), "title": r["title"], "url": r["url"], "closedAt": parse_time_ms(r.get("closedAt"))} for r in rows]
+
+    def project(p: dict) -> list[dict]:
+        # The items filter knows no closed date: closing an issue updates it, so `updated` bounds the pages.
+        items, cursor = [], None
+        while True:
+            variables = {"owner": p["owner"], "number": int(p["number"]), "filter": f"is:closed is:issue updated:>={since}", **({"cursor": cursor} if cursor else {})}
+            page = ((((graphql(CLOSED_PROJECT_QUERY, variables).get("data") or {}).get("repositoryOwner") or {}).get("projectV2") or {}).get("items")) or None
+            if page is None:
+                raise RuntimeError(f"project {p['owner']}/{p['number']}: closed issues not readable")
+            for it in page["nodes"]:
+                c = it.get("content") or {}
+                if c.get("__typename") == "Issue" and (c.get("closedAt") or "")[:10] >= since:
+                    items.append(
+                        {"key": f"{c['repository']['nameWithOwner']}#{c['number']}".lower(), "title": c.get("title") or "", "url": c.get("url") or "", "closedAt": parse_time_ms(c["closedAt"])}
+                    )
+            if not page["pageInfo"]["hasNextPage"]:
+                return items
+            cursor = page["pageInfo"]["endCursor"]
+
+    jobs = [assigned, *(lambda p=p: project(p) for p in PROJECTS if p["is_backlog"])]
+    try:
+        with ThreadPoolExecutor(len(jobs)) as pool:
+            lists = list(pool.map(lambda job: job(), jobs))
+    except RateLimited:
+        raise
+    except Exception as err:  # noqa: BLE001
+        errors.append(str(err))
+        return cached or []
+    items = list({i["key"]: i for lst in lists for i in lst}.values())
+    write_cache("closed-cache.json", items, errors)
+    return items
+
+
 def load_projects(force: bool, errors: list[str], offline: bool = False) -> list[dict]:
     """Status is read from the project side: issue-side projectItems is empty for cross-org projects.
     Offline, the cached lists are used whatever their age."""
@@ -455,8 +510,7 @@ def _fetch_refs(uniq: list[Ref], errors: list[str]) -> dict[str, dict]:
             "prs": [to_pr(p) for p in (n.get("closedByPullRequestsReferences") or {}).get("nodes") or []],
         }
 
-    for i in range(0, len(uniq), 40):
-        chunk = uniq[i : i + 40]
+    def fetch(chunk: list[Ref]) -> None:
         body = "\n".join(
             f'r{j}: repository(owner: "{o}", name: "{r}") {{ issueOrPullRequest(number: {n}) {{'
             f" __typename ... on Issue {{ {fields} }}"
@@ -469,7 +523,7 @@ def _fetch_refs(uniq: list[Ref], errors: list[str]) -> dict[str, dict]:
             raise
         except Exception as err:  # noqa: BLE001
             errors.append(f"graphql: {err}")
-            continue
+            return
         for j, r in enumerate(chunk):
             node = (data.get(f"r{j}") or {}).get("issueOrPullRequest")
             if not node:
@@ -478,6 +532,12 @@ def _fetch_refs(uniq: list[Ref], errors: list[str]) -> dict[str, dict]:
                 out[key_of(r)] = to_issue(node)
             else:
                 out[key_of(r)] = {"kind": "PullRequest", **to_pr(node), "closes": [to_issue(n) for n in node["closingIssuesReferences"]["nodes"]]}
+
+    # Chunks in parallel: each takes over a second, and the recently closed issues add a couple.
+    chunks = [uniq[i : i + 40] for i in range(0, len(uniq), 40)]
+    if chunks:
+        with ThreadPoolExecutor(min(len(chunks), 4)) as pool:
+            list(pool.map(fetch, chunks))
     return out
 
 
@@ -487,7 +547,9 @@ def _fetch_refs(uniq: list[Ref], errors: list[str]) -> dict[str, dict]:
 def build_board(force: bool = False) -> dict:
     """The board. While GitHub is rate-limited (or a backoff from an earlier limit runs) it is built
     from the session files and cached GitHub data alone, without calling GitHub; sessions whose issue
-    isn't cached land in Unlinked, and errors[0] says so."""
+    isn't cached land in Unlinked, and errors[0] says so.
+
+    Cards marked searchOnly are finished issues that are off the board: only a search shows them."""
     until = backoff_until()
     if until <= time.time():
         try:
@@ -503,13 +565,15 @@ def build_board(force: bool = False) -> dict:
 def _build_board(force: bool, offline: bool) -> dict:
     errors: list[str] = []
     links = load_links()
-    with ThreadPoolExecutor(3) as pool:
+    with ThreadPoolExecutor(4) as pool:
         f_sessions = pool.submit(read_sessions, links, errors)
         f_assigned = pool.submit(load_assigned, force, errors, offline)
         f_projects = pool.submit(load_projects, force, errors, offline)
+        f_closed = pool.submit(load_closed, force, errors, offline)
         raw = f_sessions.result()
         assigned = f_assigned.result()
         project_items = f_projects.result()
+        closed = f_closed.result()
 
     issues: dict[str, dict] = {}
 
@@ -523,6 +587,9 @@ def _build_board(force: bool, offline: bool) -> dict:
             "isMine": is_mine or prev.get("isMine", False),
         }
 
+    # Closed first: an issue reopened since the closed list was cached is open in the lists below.
+    for i in closed:
+        add_issue(i["key"], i["title"], i["url"], False, i["closedAt"], True)
     for i in assigned:
         add_issue(f"{i['repository']['nameWithOwner']}#{i['number']}".lower(), i["title"], i["url"], True, parse_time_ms(i.get("updatedAt")), True)
     status_of: dict[str, str] = {}
@@ -573,11 +640,10 @@ def _build_board(force: bool, offline: bool) -> dict:
         status = status_of.get(key, "")
         status_column = status_column_of(status, iss["isOpen"])
         last_touch = max((s["updatedAt"] for s in ss), default=0)
-        # A finished issue stays only while a session on it is live or recent.
-        if status_column == "done" and session_column in ("idle", "backlog") and last_touch < recent:
-            continue
         if session_column == "backlog" and not iss["isMine"]:
             continue
+        # A finished issue stays on the board only while a session on it is live or recent; after that a search still finds it.
+        search_only = status_column == "done" and session_column in ("idle", "backlog") and last_touch < recent
         m = meta.get(key, {})
         prs = {p["key"]: p for p in [*m.get("prs", []), *(p for s in ss for p in s["prs"])]}
         cards.append(
@@ -590,6 +656,7 @@ def _build_board(force: bool, offline: bool) -> dict:
                 "statusColumn": status_column,
                 "statusItem": status_item.get(key),
                 "sessionColumn": session_column,
+                "searchOnly": search_only,
                 "updatedAt": max(iss["updatedAt"], last_touch),
                 "sessions": ss,
                 "prs": list(prs.values()),
@@ -642,8 +709,9 @@ def ago(ms: int) -> str:
 
 def summary(board: dict, grouping: str) -> str:
     lines = []
+    on_board = [c for c in board["cards"] if not c.get("searchOnly")]
     for col_id, title in columns(grouping):
-        cs = column_cards(board["cards"], col_id, grouping)
+        cs = column_cards(on_board, col_id, grouping)
         lines.append(f"## {title} ({len(cs)})")
         for c in cs:
             tag = badge(c) if grouping == "status" else c["status"]

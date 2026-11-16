@@ -652,7 +652,7 @@ class BoardApp(App):
 
     def compose(self) -> ComposeResult:
         yield Static("loading…", id="status")
-        filter_box = FilterInput(placeholder="filter: every word must match a title, repo #N, status, label or session name", id="filter")
+        filter_box = FilterInput(placeholder="filter: every word must match a title, repo #N, status, label or session name; recently closed issues match too", id="filter")
         filter_box.show(False)
         yield filter_box
         yield Columns(id="columns")
@@ -775,7 +775,10 @@ class BoardApp(App):
                 lv.index = match
 
     def visible(self, rows: list[dict]) -> list[dict]:
-        return [r for r in rows if core.matches(r, self.filter)] if self.filter else rows
+        """The rows to draw: a filter also reaches the search-only cards (finished issues that left the board)."""
+        if self.filter:
+            return [r for r in rows if core.matches(r, self.filter)]
+        return [r for r in rows if not r.get("searchOnly")]
 
     def groups(self) -> list[tuple[str, str, list[dict]]]:
         cards = [{**c, "hidden": True} if c["key"] in self.hidden else c for c in self.visible(self.data["cards"])]
