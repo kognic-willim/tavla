@@ -19,6 +19,8 @@ from contextlib import suppress
 from pathlib import Path
 
 JOBS = Path.home() / ".claude" / "jobs"
+# Conversations, as <project>/<session id>.jsonl: `claude rm` keeps them, which is what makes a deleted session resumable.
+TRANSCRIPTS = Path.home() / ".claude" / "projects"
 # Local state and config.toml.
 CONFIG = Path(os.environ.get("TAVLA_HOME", Path.home() / ".config" / "tavla"))
 # The four below are set from config.toml by load_config().
@@ -240,6 +242,96 @@ def toggle_hidden(issue_key: str) -> set[str]:
     return hidden
 
 
+# --- session history -----------------------------------------------------------
+
+
+def load_history() -> dict[str, dict]:
+    try:
+        return json.loads((CONFIG / "history.json").read_text())
+    except FileNotFoundError, json.JSONDecodeError:
+        return {}
+
+
+def save_history(history: dict[str, dict]) -> None:
+    CONFIG.mkdir(parents=True, exist_ok=True)
+    (CONFIG / "history.json").write_text(json.dumps(history, indent=2, sort_keys=True) + "\n")
+
+
+def history_record(sess: dict) -> dict:
+    """What is kept of a session so that it can be listed and resumed once it is gone."""
+    return {
+        "id": sess["id"],
+        "sessionId": sess.get("sessionId") or "",
+        "name": sess.get("name") or sess["id"],
+        "cwd": sess.get("cwd") or "",
+        "issues": list(sess.get("issues") or []),
+        "prs": list(sess.get("prs") or []),
+        "result": " ".join((sess.get("result") or sess.get("detail") or "").split())[:200],
+        "updatedAt": sess.get("updatedAt") or 0,
+        "isInteractive": bool(sess.get("isInteractive")),
+    }
+
+
+def from_transcript(short_id: str, issues: list[str]) -> dict:
+    """A record for a session known only by its id (a link left behind by a session deleted elsewhere):
+    its session id, name and directory are read from its conversation file. Without one
+    the record has no sessionId, which keeps it off the cards."""
+    sess = {"id": short_id, "issues": issues}
+    path = next(iter(sorted(TRANSCRIPTS.glob(f"*/{short_id}-*.jsonl"))), None) if TRANSCRIPTS.is_dir() else None
+    if path is None:
+        return history_record(sess)
+    sess |= {"sessionId": path.stem, "updatedAt": int(path.stat().st_mtime * 1000)}
+    names: dict[str, str] = {}
+    with path.open(errors="replace") as f:
+        for line in f:
+            # Titles are rewritten throughout the file, between request lines of a megabyte: parse only the lines that can matter.
+            if not any(f'"{field}"' in line for field in ("agentName", "customTitle", "aiTitle", *(() if sess.get("cwd") else ("cwd",)))):
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(row, dict):
+                continue
+            names |= {field: str(row[field]) for field in ("agentName", "customTitle", "aiTitle") if row.get(field)}
+            if not sess.get("cwd") and isinstance(row.get("cwd"), str):
+                sess["cwd"] = row["cwd"]
+    sess["name"] = names.get("agentName") or names.get("customTitle") or names.get("aiTitle")
+    return history_record(sess)
+
+
+def update_history(sessions: list[dict], links: dict[str, list[str]], errors: list[str]) -> list[dict]:
+    """Record the sessions that sit on a card, and return the recorded ones that are gone, as session rows.
+
+    A session is gone when it is no longer listed: a background one was deleted, an interactive one
+    ended. Its conversation is still on disk, so resume_session brings it back. Sessions deleted
+    before they were recorded are picked up once from the manual links they left behind."""
+    history = load_history()
+    before = json.dumps(history, sort_keys=True)
+    live = {s["id"] for s in sessions}
+    for s in sessions:
+        if s["issues"]:
+            history[s["id"]] = history_record(s)
+    for sid, keys in links.items():
+        if sid not in live and sid not in history:
+            try:
+                history[sid] = from_transcript(sid, list(keys))
+            except OSError as err:
+                errors.append(f"history: {err}")
+    if json.dumps(history, sort_keys=True) != before:
+        try:
+            save_history(history)
+        except OSError as err:  # a history that can't be saved must not cost the board
+            errors.append(f"history.json: {err}")
+    # Without `claude agents` no interactive session is listed: that is not them having ended.
+    agents_failed = any(e.startswith("claude agents:") for e in errors)
+    return [
+        {**r, "state": "ended" if r["isInteractive"] else "deleted", "kind": "idle", "detail": "", "intent": "", "refs": r["issues"], "isPast": True}
+        for r in history.values()
+        if r["id"] not in live and r.get("sessionId") and not (agents_failed and r["isInteractive"])
+    ]
+
+
 # --- sessions ----------------------------------------------------------------
 
 
@@ -316,7 +408,8 @@ def find_sessions(sessions: list[dict], needle: str) -> list[dict]:
 def search_text(row: dict) -> str:
     """What a filter matches on: a card's title, repo#N, status, labels and session names; a session's name, id and refs."""
     if "sessions" in row:
-        parts = [row["title"], row["key"], row["key"].split("/", 1)[1], row["status"], *(lb["name"] for lb in row.get("labels") or []), *(s["name"] for s in row["sessions"])]
+        names = [s["name"] for s in [*row["sessions"], *row.get("pastSessions", [])]]
+        parts = [row["title"], row["key"], row["key"].split("/", 1)[1], row["status"], *(lb["name"] for lb in row.get("labels") or []), *names]
     else:
         parts = [row["name"], row["id"], *row.get("refs", [])]
     return " ".join(p for p in parts if p).lower()
@@ -549,7 +642,8 @@ def build_board(force: bool = False) -> dict:
     from the session files and cached GitHub data alone, without calling GitHub; sessions whose issue
     isn't cached land in Unlinked, and errors[0] says so.
 
-    Cards marked searchOnly are finished issues that are off the board: only a search shows them."""
+    Cards marked searchOnly are finished issues that are off the board: only a search shows them.
+    A card's pastSessions are the deleted or ended sessions that were on it; they place no card."""
     until = backoff_until()
     if until <= time.time():
         try:
@@ -631,6 +725,7 @@ def _build_board(force: bool, offline: bool) -> dict:
                 prs[info["key"]] = {"key": info["key"], "url": info["url"], "state": info["state"]}
         sessions.append({**sess, "issues": sorted(found), "prs": list(prs.values())})
 
+    past = sorted(update_history(sessions, links, errors), key=lambda s: -s["updatedAt"])
     recent = now_ms() - RECENT_S * 1000
     cards = []
     for key, iss in issues.items():
@@ -659,6 +754,7 @@ def _build_board(force: bool, offline: bool) -> dict:
                 "searchOnly": search_only,
                 "updatedAt": max(iss["updatedAt"], last_touch),
                 "sessions": ss,
+                "pastSessions": [s for s in past if key in s["issues"]],
                 "prs": list(prs.values()),
                 "labels": m.get("labels", []),
                 "subIssues": m.get("subIssues", {"total": 0, "completed": 0}),
@@ -843,6 +939,32 @@ def start_progress(card: dict) -> bool:
     return True
 
 
+def resume_session(needle: str) -> dict:
+    """Bring a deleted or ended session back as a background session, and return its history record.
+
+    `claude --bg --resume` continues the conversation under the same id; it runs in the session's own
+    directory, where Claude Code keeps the conversation. The issues the session was on are linked
+    again, since deleting it dropped its manual links. A session that is still listed is left alone."""
+    history = load_history()
+    n = needle.lower()
+    found = [r for r in history.values() if r.get("sessionId") and (n in (r["id"], r["sessionId"]) or n == r["name"].lower())]
+    found = found or [r for r in history.values() if r.get("sessionId") and (r["id"].startswith(n) or n in r["name"].lower())]
+    if len(found) != 1:
+        raise ValueError(f'"{needle}" matches {", ".join(r["id"] for r in found) or "no recorded session"}; use an exact id')
+    rec = found[0]
+    if (JOBS / rec["id"]).is_dir():
+        return rec
+    cwd = Path(rec["cwd"]) if rec["cwd"] and Path(rec["cwd"]).is_dir() else SESSION_CWD
+    named = ["--name", rec["name"][:60]] if rec["name"] != rec["id"] else []
+    out = run(["claude", "--bg", *named, "--resume", rec["sessionId"]], cwd=cwd)
+    m = re.search(r"\b[0-9a-f]{8}\b", out)
+    if not m:
+        raise RuntimeError(f"no session id in: {out.strip()}")
+    for key in rec["issues"]:
+        link(m[0], key)
+    return {**rec, "id": m[0], "cwd": str(cwd)}
+
+
 def stop_session(session_id: str) -> str:
     """Stop a background session; its conversation is kept and attaching resumes it."""
     return run(["claude", "stop", session_id], timeout=30).strip()
@@ -851,8 +973,18 @@ def stop_session(session_id: str) -> str:
 def delete_session(session_id: str) -> str:
     """Delete a background session and its worktree, and drop its manual links.
 
+    A session no board build has recorded yet (one deleting itself) is recorded first from its job
+    file and manual links, so its card still lists it for resuming.
+
     claude rm refuses a worktree with unpushed commits; its message, raised here, names the flag that discards them."""
     links = load_links()
+    history = load_history()
+    if session_id not in history and links.get(session_id):
+        with suppress(OSError, json.JSONDecodeError):
+            st = json.loads((JOBS / session_id / "state.json").read_text())
+            when = parse_time_ms(st.get("updatedAt") or st.get("createdAt"))
+            history[session_id] = history_record({"id": session_id, "sessionId": st.get("sessionId"), "name": st.get("name"), "cwd": st.get("cwd"), "issues": links[session_id], "updatedAt": when})
+            save_history(history)
     unlink(session_id, None)  # before the delete: a session deleting itself does not outlive `claude rm`
     try:
         return run(["claude", "rm", session_id], timeout=60).strip()
@@ -919,6 +1051,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("title")
     p.add_argument("--repo", default=ISSUE_REPOS[0][0] if ISSUE_REPOS else None, help="owner/repo; defaults to the first issue_repos entry in config.toml")
     p.add_argument("--body", default="")
+    p = sub.add_parser("resume", help="bring a deleted session back as a background session, under the same id")
+    p.add_argument("session")
     p = sub.add_parser("stop", help="stop a background session, keeping its conversation")
     p.add_argument("session")
     p = sub.add_parser("rm", help="delete a background session and its worktree")
@@ -950,6 +1084,9 @@ def main(argv: list[str] | None = None) -> int:
             if not a.repo:
                 raise ValueError("no --repo given and no issue_repos in config.toml")
             print(create_issue(a.repo, a.title, a.body)["url"])
+        elif a.cmd == "resume":
+            rec = resume_session(a.session)
+            print(f'Resumed {rec["id"]} ("{rec["name"]}"); tavla attach {rec["id"]} opens it.')
         elif a.cmd in ("stop", "rm"):
             own = getattr(a, "own", False)
             if own == bool(a.session):

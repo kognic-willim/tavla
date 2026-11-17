@@ -24,8 +24,8 @@
 - GitHub calls share one GraphQL budget of 5,000 points an hour, `gh search` included. Batch new lookups into the existing aliased queries and the TTL caches; never add a call per card or per refresh.
 - The project lists hold open issues only (`items(query: "is:open is:issue")`): nothing may read a closed issue's status or `statusItem` from them. Pages of one project are fetched one after another at about 1.5 s per 100 items, so a filter that drops pages is the lever on a cold refresh.
 - A warm refresh costs only the `claude agents --json` call; the board-building Python is negligible. Measure before optimizing it.
-- `~/.claude/jobs/*/state.json` and `claude agents --json` are Claude Code internals that change between versions: read fields defensively, so a missing field leaves a blank rather than raising.
-- Local state lives under `CONFIG` (`TAVLA_HOME`, default `~/.config/tavla/`): `config.toml`, `links.json` and `hidden.json` are user data, the `*-cache.json` files are disposable.
+- `~/.claude/jobs/*/state.json`, `claude agents --json` and the conversation files under `~/.claude/projects/` are Claude Code internals that change between versions: read fields defensively, so a missing field leaves a blank rather than raising.
+- Local state lives under `CONFIG` (`TAVLA_HOME`, default `~/.config/tavla/`): `config.toml`, `links.json`, `hidden.json` and `history.json` are user data, the `*-cache.json` files are disposable.
 - No owner, repository, project number or local path is written into the code, the tests or the docs: they come from `config.toml` (`PROJECTS`, `ISSUE_REPOS`, `SESSION_CWD`, `THEME`), the tests use made-up names (`acme/infra`, `me/todo`), and the docs use `octocat`. With no config file every feature either works or says which key to add.
 
 ## Tests

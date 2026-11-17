@@ -39,6 +39,7 @@ CLOSED_PROJECTS = {"me": [closed_item("me/todo", 5, "Shipped report", 5), closed
 CLOSED = {"acme/infra#20", "acme/infra#31", "me/todo#5", "me/todo#4"}
 GRAPHQL_CALLS: list[str] = []
 STATUS_SETS: list[dict] = []
+RESUMED: list[dict] = []
 
 
 def fake_run(argv, timeout=60, cwd=None):
@@ -62,6 +63,9 @@ def fake_run(argv, timeout=60, cwd=None):
     if cmd.startswith("gh issue create"):
         repo = argv[argv.index("--repo") + 1]
         return f"\nCreating issue in {repo}\n\nhttps://github.com/{repo}/issues/77\n"
+    if cmd.startswith("claude --bg") and "--resume" in argv:
+        RESUMED.append({"argv": argv, "cwd": cwd})
+        return f"backgrounded · {argv[-1][:8]} (idle — send a prompt to start)\n"
     if cmd.startswith("claude --bg"):
         return "Started background session dddd4444\n"
     raise AssertionError(f"unexpected command: {cmd}")
@@ -123,6 +127,7 @@ def env(tmp_path, monkeypatch):
         (jobs / jid).mkdir(parents=True)
         (jobs / jid / "state.json").write_text(json.dumps(st))
     monkeypatch.setattr(core, "JOBS", jobs)
+    monkeypatch.setattr(core, "TRANSCRIPTS", tmp_path / "projects")
     monkeypatch.setattr(core, "CONFIG", tmp_path / "config")
     monkeypatch.setattr(
         core, "PROJECTS", [{"owner": "me", "number": "1", "is_backlog": True}, {"owner": "team", "number": "23", "is_backlog": False}, {"owner": "extra", "number": "2", "is_backlog": False}]
@@ -134,6 +139,7 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setattr(core, "graphql", fake_graphql)
     GRAPHQL_CALLS.clear()
     STATUS_SETS.clear()
+    RESUMED.clear()
 
 
 def test_routine_refresh_reads_github_metadata_from_cache():
@@ -1426,5 +1432,155 @@ def test_tui_new_issue_without_a_configured_repo_says_where_to_add_one(monkeypat
             await pilot.pause()
             assert not isinstance(app.screen, tui.NewIssue)
             assert any("issue_repos" in str(n.message) for n in app._notifications)
+
+    asyncio.run(scenario())
+
+
+def delete_job(monkeypatch, jid, session_id):
+    """Give the job a session id, then make `claude rm` remove its directory as the real one does."""
+    import shutil
+
+    state = core.JOBS / jid / "state.json"
+    state.write_text(json.dumps({**json.loads(state.read_text()), "sessionId": session_id}))
+
+    def run(argv, timeout=60, cwd=None):
+        if argv[:2] == ["claude", "rm"]:
+            shutil.rmtree(core.JOBS / argv[2])
+            return f"removed {argv[2]}\n"
+        return fake_run(argv, timeout, cwd)
+
+    monkeypatch.setattr(core, "run", run)
+
+
+def test_deleted_session_stays_on_its_card_and_resumes_under_the_same_id(monkeypatch, capsys):
+    delete_job(monkeypatch, "cccc3333", "cccc3333-aaaa-bbbb")
+    core.link("cccc3333", "acme/infra#9")
+    card = next(c for c in core.build_board()["cards"] if c["key"] == "acme/infra#9")
+    assert [s["id"] for s in card["sessions"]] == ["cccc3333"] and card["pastSessions"] == []
+    core.delete_session("cccc3333")
+    assert core.load_links() == {}
+    board = core.build_board()
+    card = next(c for c in board["cards"] if c["key"] == "acme/infra#9")
+    assert card["sessions"] == [] and card["sessionColumn"] == "backlog"  # a deleted session places no card
+    [past] = card["pastSessions"]
+    assert (past["id"], past["name"], past["state"], past["isPast"], past["result"]) == ("cccc3333", "random question", "deleted", True, "x is y")
+    assert core.matches(card, "random question")
+    assert all(s["id"] != "cccc3333" for s in board["unlinked"])
+
+    assert core.main(["resume", "cccc"]) == 0
+    assert RESUMED == [{"argv": ["claude", "--bg", "--name", "random question", "--resume", "cccc3333-aaaa-bbbb"], "cwd": core.SESSION_CWD}]
+    assert core.load_links() == {"cccc3333": ["acme/infra#9"]}  # back on its card once it is listed again
+    assert "Resumed cccc3333" in capsys.readouterr().out
+    assert core.main(["resume", "nope"]) == 1 and "no recorded session" in capsys.readouterr().err
+
+
+def test_resume_leaves_a_session_that_is_still_listed_alone():
+    state = core.JOBS / "aaaa1111" / "state.json"
+    state.write_text(json.dumps({**JOBS["aaaa1111"], "sessionId": "aaaa1111-x"}))
+    core.build_board()
+    assert core.resume_session("aaaa1111")["id"] == "aaaa1111" and RESUMED == []
+
+
+def test_session_deleting_itself_before_any_board_saw_it_is_still_recorded(monkeypatch):
+    delete_job(monkeypatch, "cccc3333", "cccc3333-aaaa-bbbb")
+    core.link("cccc3333", "acme/infra#9")
+    core.delete_session("cccc3333")
+    card = next(c for c in core.build_board()["cards"] if c["key"] == "acme/infra#9")
+    assert [(s["id"], s["sessionId"], s["name"]) for s in card["pastSessions"]] == [("cccc3333", "cccc3333-aaaa-bbbb", "random question")]
+
+
+def test_sessions_deleted_before_history_existed_are_found_through_their_links_and_transcripts(tmp_path):
+    project = core.TRANSCRIPTS / "-w-notes"
+    project.mkdir(parents=True)
+    rows = [{"type": "agent-name", "agentName": "old digging"}, "not an object", {"type": "user", "cwd": str(tmp_path)}]
+    (project / "ffff6666-1111-2222.jsonl").write_text("\n".join(json.dumps(r) for r in rows) + "\n{broken\n")
+    core.save_links({"ffff6666": ["acme/infra#9"], "99990000": ["acme/infra#9"]})  # the second has no conversation left
+    card = next(c for c in core.build_board()["cards"] if c["key"] == "acme/infra#9")
+    assert [(s["id"], s["sessionId"], s["name"], s["cwd"]) for s in card["pastSessions"]] == [("ffff6666", "ffff6666-1111-2222", "old digging", str(tmp_path))]
+    assert core.resume_session("ffff6666")["cwd"] == str(tmp_path) and RESUMED[0]["cwd"] == tmp_path
+    (project / "ffff6666-1111-2222.jsonl").unlink()
+    core.build_board()  # read once: the record, not the file, carries it from here on
+    assert set(core.load_history()) >= {"ffff6666", "99990000"}
+
+
+def test_ended_interactive_session_is_not_past_while_claude_agents_fails(monkeypatch):
+    core.link("eeee5555", "acme/infra#9")
+    core.build_board()
+
+    def run(argv, timeout=60, cwd=None):
+        if argv[:2] == ["claude", "agents"]:
+            raise RuntimeError("claude: not found")
+        return fake_run(argv, timeout, cwd)
+
+    monkeypatch.setattr(core, "run", run)
+    card = next(c for c in core.build_board()["cards"] if c["key"] == "acme/infra#9")
+    assert card["pastSessions"] == []
+    monkeypatch.setattr(core, "run", lambda argv, timeout=60, cwd=None: "[]" if argv[:2] == ["claude", "agents"] else fake_run(argv, timeout, cwd))
+    card = next(c for c in core.build_board()["cards"] if c["key"] == "acme/infra#9")
+    assert [(s["id"], s["state"]) for s in card["pastSessions"]] == [("eeee5555", "ended")]
+
+
+def test_tui_deleted_sessions_come_last_under_a_divider_and_enter_resumes_and_attaches(monkeypatch):
+    from tavla import tui
+
+    delete_job(monkeypatch, "cccc3333", "cccc3333-aaaa-bbbb")
+    core.link("cccc3333", "acme/infra#7")
+    core.build_board()
+    core.delete_session("cccc3333")
+    attached, stopped = [], []
+    monkeypatch.setattr(core, "attach", lambda sid, title="", dry_run=False, cwd="": attached.append((sid, title, cwd)) or "")
+    monkeypatch.setattr(core, "stop_session", lambda sid: stopped.append(sid) or "")
+
+    async def scenario():
+        app = tui.BoardApp()
+        async with app.run_test(size=(190, 45)) as pilot:
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            blocked = app.query_one("#col-blocked")
+            blocked.focus()
+            blocked.index = 0
+            await pilot.pause()
+            rows = list(app.query_one("#sessions").children)
+            assert [type(r).__name__ for r in rows] == ["SessDetailRow", "Divider", "SessDetailRow"]
+            assert rows[0].sess["id"] == "aaaa1111" and rows[2].sess["id"] == "cccc3333" and rows[2].has_class("is-past")
+            assert str(app.query_one("#count-sessions").render()) == "1"  # live sessions only
+            await pilot.press("enter", "down")  # into the sessions, over the divider
+            await pilot.pause()
+            assert app.query_one("#sessions").highlighted_child is rows[2]
+            # Only enter acts on a deleted session.
+            await pilot.press("ctrl+x")
+            await pilot.pause()
+            assert not isinstance(app.screen, tui.StopOrDelete) and any("enter resumes it" in str(n.message) for n in app._notifications)
+            await pilot.press("enter")
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            assert [r["argv"][-1] for r in RESUMED] == ["cccc3333-aaaa-bbbb"] and stopped == []
+            assert attached == [("cccc3333", "random question", str(core.SESSION_CWD))]
+            assert core.load_links()["cccc3333"] == ["acme/infra#7"]
+
+    asyncio.run(scenario())
+
+
+def test_tui_enter_on_a_card_with_only_deleted_sessions_lands_on_the_first_of_them(monkeypatch):
+    from tavla import tui
+
+    delete_job(monkeypatch, "cccc3333", "cccc3333-aaaa-bbbb")
+    core.link("cccc3333", "acme/infra#9")
+    core.build_board()
+    core.delete_session("cccc3333")
+
+    async def scenario():
+        app = tui.BoardApp()
+        async with app.run_test(size=(190, 45)) as pilot:
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            todo = app.query_one("#col-todo")
+            todo.focus()
+            todo.index = next(i for i, it in enumerate(todo.children) if getattr(it, "card", {}).get("key") == "acme/infra#9")
+            await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause()
+            sessions = app.query_one("#sessions")
+            assert app.focused is sessions and sessions.highlighted_child.sess["id"] == "cccc3333"
 
     asyncio.run(scenario())

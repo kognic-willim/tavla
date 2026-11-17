@@ -187,17 +187,18 @@ class SessDetailRow(ListItem):
     def __init__(self, sess: dict) -> None:
         self.sess = sess
         kind = sess["kind"]
+        glyph = "◌" if sess.get("isPast") else GLYPH[kind]
         prs = "  ".join(f"[{pr_color(p['state'])}]⎇ {escape(p['key'].split('/', 1)[1])}[/]" for p in sess.get("prs") or [])
         super().__init__(
             Horizontal(
-                Label(f"[{SESSION_COLOR[kind]}]{GLYPH[kind]} {escape(sess['state'])}[/]", classes="s-state"),
+                Label(f"[{SESSION_COLOR[kind]}]{glyph} {escape(sess['state'])}[/]", classes="s-state"),
                 Label(escape(sess["name"]), classes="s-name"),
                 Label(core.ago(sess["updatedAt"]), classes="s-ago"),
                 Label(sess["id"], classes="s-id"),
                 Label(prs, classes="s-prs"),
                 Label(escape(" ".join((sess["result"] or sess["detail"]).split())), classes="s-result"),
             ),
-            classes="row",
+            classes="row is-past" if sess.get("isPast") else "row",
         )
 
 
@@ -511,7 +512,7 @@ class StopOrDelete(ModalScreen[str | None]):
             name = f"  [b]{escape(s['name'])}[/]" if s["name"] != s["id"] else ""
             yield Label(f"Session {s['id']}{name}  [{SESSION_COLOR[s['kind']]}]{escape(s['state'])}[/]", classes="title")
             yield Label("[b]s[/] stop: ends the process, keeps the conversation; attach resumes it")
-            yield Label("[b]d[/] delete: removes the session and its worktree (refused while it has unpushed commits)")
+            yield Label("[b]d[/] delete: removes the session and its worktree (refused while it has unpushed commits); its card keeps it under Deleted, where enter resumes it")
             yield Label("[$text-muted]esc cancels[/]", classes="hint")
 
     def action_pick(self, choice: str) -> None:
@@ -570,6 +571,8 @@ class BoardApp(App):
     .divider Rule {{ width: 1fr; height: 1; margin: 0; color: $panel-lighten-2; }}
     .card.is-backlog .card-title {{ color: $text-muted; text-style: none; }}
     .row.is-backlog .c-title {{ color: $text-muted; }}
+    .row.is-past .s-name {{ color: $text-muted; }}
+    #sessions > ListItem.divider {{ margin-bottom: 0; }}
     .col.list {{ width: 1fr; margin: 0; }}
     .list-head {{ height: 1; padding: 0 2; margin-bottom: 1; color: $text-muted; text-style: bold; }}
     ListView.cards > ListItem.row {{ height: 1; padding: 0 1; background: transparent; }}
@@ -873,22 +876,25 @@ class BoardApp(App):
             link.text, link.url = ref, cur["url"]
             body = cur.get("body") or "*No description.*"
             sessions = cur["sessions"]
+            past = cur.get("pastSessions") or []
         elif cur:
             icon.update(f"[{SESSION_COLOR[cur['kind']]}]{GLYPH[cur['kind']]}[/]")
             link.text, link.url = f"unlinked session {cur['id']}", ""
             body = cur.get("intent") or "*No prompt recorded.*"
-            sessions = [cur]
+            sessions, past = [cur], []
         else:
             icon.update("")
             link.text, link.url = "Select a card", ""
             body = ""
-            sessions = []
+            sessions, past = [], []
         if body != self.body_shown:
             self.body_shown = body
             await self.query_one("#detail-body", Markdown).update(body)
             self.query_one("#detail-body-scroll", VerticalScroll).scroll_home(animate=False)
         self.query_one("#count-sessions", Label).update(str(len(sessions)))
-        await self.replace_items(self.query_one("#sessions", ListView), sessions, SessDetailRow, None)
+        # Deleted and ended sessions come last, under their own divider, as Backlog cards do in a column.
+        rows = [*sessions, *([{"divider": "Deleted", "count": len(past)}, *past] if past else [])]
+        await self.replace_items(self.query_one("#sessions", ListView), rows, lambda r: Divider(r) if "divider" in r else SessDetailRow(r), None)
 
     # --- events ----------------------------------------------------------------
 
@@ -943,9 +949,9 @@ class BoardApp(App):
         box.focus()
 
     def open_sessions(self, card: dict) -> None:
-        sessions = self.query_one("#sessions", ListView)
-        if card["sessions"]:
-            sessions.index = 0
+        sessions = self.query_one("#sessions", CardList)
+        if card["sessions"] or card.get("pastSessions"):
+            sessions.action_first()  # with only deleted sessions the first row is their divider
             sessions.focus()
         else:
             self.notify("No sessions on this issue yet; press n to start one.")
@@ -960,6 +966,16 @@ class BoardApp(App):
             return self.current["sessions"][0]
         return None
 
+    def acting_session(self, hint: str = "Select a session first.") -> dict | None:
+        """The session a link, unlink or stop/delete key acts on; a deleted one takes only enter, which resumes it."""
+        sess = self.focused_session()
+        if not sess:
+            self.notify(hint)
+        elif sess.get("isPast"):
+            self.notify(f"{sess['id']} is {sess['state']}; enter resumes it.")
+            return None
+        return sess
+
     # --- actions ---------------------------------------------------------------
 
     def action_attach(self) -> None:
@@ -973,7 +989,15 @@ class BoardApp(App):
 
     @work(thread=True)
     def attach(self, sess: dict) -> None:
-        if sess.get("isInteractive"):
+        if sess.get("isPast"):
+            try:
+                sess = core.resume_session(sess["id"])
+                self.call_from_thread(self.notify, f"Resumed {sess['id']} as a background session")
+            except Exception as err:  # noqa: BLE001
+                self.call_from_thread(self.notify, f"Could not resume {sess['id']}: {err}", severity="error", timeout=15)
+                return
+            self.call_from_thread(self.action_refresh)
+        elif sess.get("isInteractive"):
             self.call_from_thread(self.notify, f"{sess['name']} is interactive and already runs in its own terminal.", severity="warning")
             return
         try:
@@ -1116,9 +1140,8 @@ class BoardApp(App):
         self.push_screen(AskPrompt(question), go)
 
     def action_link(self) -> None:
-        sess = self.focused_session()
+        sess = self.acting_session()
         if not sess:
-            self.notify("Select a session first.")
             return
 
         def go(target: str | None) -> None:
@@ -1133,9 +1156,8 @@ class BoardApp(App):
         self.push_screen(Ask(f"Link {sess['id']} ({sess['name']}) to issue", "https://github.com/owner/repo/issues/N or owner/repo#N"), go)
 
     def action_unlink(self) -> None:
-        sess = self.focused_session()
+        sess = self.acting_session()
         if not sess:
-            self.notify("Select a session first.")
             return
         if not core.load_links().get(sess["id"]):
             self.notify("No manual links on this session; links from its first prompt or PRs can't be removed here.")
@@ -1145,9 +1167,8 @@ class BoardApp(App):
         self.action_refresh()
 
     def action_stop_delete(self) -> None:
-        sess = self.focused_session()
+        sess = self.acting_session("Select a session first: on a card with several, pick one in the sessions panel.")
         if not sess:
-            self.notify("Select a session first: on a card with several, pick one in the sessions panel.")
             return
         if sess.get("isInteractive"):
             self.notify(f"{sess['name']} is interactive; stop it in its own terminal.", severity="warning")
