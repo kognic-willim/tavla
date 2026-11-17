@@ -1544,6 +1544,7 @@ def test_tui_deleted_sessions_come_last_under_a_divider_and_enter_resumes_and_at
             assert [type(r).__name__ for r in rows] == ["SessDetailRow", "Divider", "SessDetailRow"]
             assert rows[0].sess["id"] == "aaaa1111" and rows[2].sess["id"] == "cccc3333" and rows[2].has_class("is-past")
             assert str(app.query_one("#count-sessions").render()) == "1"  # live sessions only
+            assert rows[1].region.y - rows[0].region.y == 2  # a blank line sets the divider off from the live sessions
             await pilot.press("enter", "down")  # into the sessions, over the divider
             await pilot.pause()
             assert app.query_one("#sessions").highlighted_child is rows[2]
@@ -1582,5 +1583,6 @@ def test_tui_enter_on_a_card_with_only_deleted_sessions_lands_on_the_first_of_th
             await pilot.pause()
             sessions = app.query_one("#sessions")
             assert app.focused is sessions and sessions.highlighted_child.sess["id"] == "cccc3333"
+            assert sessions.children[0].region.y == sessions.region.y  # no blank line above a divider that comes first
 
     asyncio.run(scenario())

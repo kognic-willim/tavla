@@ -572,7 +572,8 @@ class BoardApp(App):
     .card.is-backlog .card-title {{ color: $text-muted; text-style: none; }}
     .row.is-backlog .c-title {{ color: $text-muted; }}
     .row.is-past .s-name {{ color: $text-muted; }}
-    #sessions > ListItem.divider {{ margin-bottom: 0; }}
+    #sessions > ListItem.divider {{ margin: 1 0 0 0; }}
+    #sessions > ListItem.divider:first-child {{ margin-top: 0; }}
     .col.list {{ width: 1fr; margin: 0; }}
     .list-head {{ height: 1; padding: 0 2; margin-bottom: 1; color: $text-muted; text-style: bold; }}
     ListView.cards > ListItem.row {{ height: 1; padding: 0 1; background: transparent; }}
