@@ -71,6 +71,21 @@ def fake_run(argv, timeout=60, cwd=None):
     raise AssertionError(f"unexpected command: {cmd}")
 
 
+def parent_node(repo, number, title, total=0, completed=0):
+    return {
+        "number": number,
+        "title": title,
+        "url": f"https://github.com/{repo}/issues/{number}",
+        "state": "OPEN",
+        "repository": {"nameWithOwner": repo},
+        "subIssuesSummary": {"total": total, "completed": completed},
+    }
+
+
+# The flaky deploy belongs to an epic that has no card; the personal todo is a sub-issue of another card.
+PARENTS = {"acme/infra#7": parent_node("acme/platform", 2, "Reliable rollouts", 4, 1), "acme/infra#11": parent_node("acme/infra", 9, "Assigned but untouched", 1, 0)}
+
+
 def fake_graphql(query, variables=None):
     if query.strip().startswith("{ rateLimit"):
         return {"data": {"rateLimit": {"remaining": 10, "resetAt": "2030-01-01T00:00:00Z"}}}
@@ -101,6 +116,7 @@ def fake_graphql(query, variables=None):
                 "labels": {"nodes": [{"name": "bug [p1]", "color": "d73a4a"}] if rich else []},
                 "subIssuesSummary": {"total": 3 if rich else 0, "completed": 1 if rich else 0},
                 "assignees": {"nodes": []},
+                "parent": PARENTS.get(f"{r}#{n}"),
                 "closedByPullRequestsReferences": {"nodes": [{"number": 50, "state": "OPEN", "url": f"https://github.com/{r}/pull/50", "repository": {"nameWithOwner": r}}] if rich else []},
             }  # fmt: skip
 
@@ -1694,3 +1710,82 @@ def test_tui_enter_on_a_card_with_only_deleted_sessions_lands_on_the_first_of_th
             assert sessions.children[0].region.y == sessions.region.y  # no blank line above a divider that comes first
 
     asyncio.run(scenario())
+
+
+def test_cards_carry_their_parent_issue_and_a_filter_matches_it():
+    cards = {c["key"]: c for c in core.build_board()["cards"]}
+    flaky = cards["acme/infra#7"]
+    assert flaky["parent"] == {"key": "acme/platform#2", "title": "Reliable rollouts", "url": "https://github.com/acme/platform/issues/2", "isOpen": True, "subIssues": {"total": 4, "completed": 1}}
+    assert cards["acme/charts#3"]["parent"] is None
+    for query in ("rollouts", "platform#2", "acme/platform#2", "flaky reliable"):
+        assert core.matches(flaky, query), query
+    assert [k for k, c in cards.items() if not c["searchOnly"] and core.matches(c, "reliable rollouts")] == ["acme/infra#7"]
+
+
+def test_groups_by_parent_issue_with_a_parent_card_leading_its_own_group():
+    board = core.build_board()
+    groups = {g["id"]: g for g in core.groups([c for c in board["cards"] if not c["searchOnly"]], "parent")}
+    assert [c["key"] for c in groups["acme/platform#2"]["cards"]] == ["acme/infra#7"]
+    assert [c["key"] for c in groups["acme/infra#9"]["cards"]] == ["acme/infra#9", "acme/infra#11"]  # the parent is a card too, and leads
+    assert list(groups)[-1] == "none" and [c["key"] for c in groups["none"]["cards"]] == ["acme/charts#3"]
+    text = core.summary(board, "parent")
+    assert "## Reliable rollouts (1) [acme/platform#2 1/4 done]\n- acme/infra#7 Deploy is flaky [Blocked]" in text
+    assert "## No parent (1)\n- acme/charts#3" in text
+
+
+def test_tui_card_and_list_row_name_the_parent_issue():
+    from tavla import tui
+
+    async def scenario():
+        app = tui.BoardApp()
+        async with app.run_test(size=(190, 45)) as pilot:
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            assert str(app.query_one("#col-blocked CardItem .card-parent").render()) == "↳ platform #2 Reliable rollouts"
+            todo = {c.card["key"]: c for c in app.query("#col-todo CardItem")}
+            assert str(todo["acme/infra#11"].query_one(".card-parent").render()) == "↳ #9 Assigned but untouched"  # same repository: the number is enough
+            assert not todo["acme/charts#3"].query(".card-parent")
+            await pilot.press("v")
+            await pilot.pause()
+            rows = {r.card["key"]: r for r in app.query(tui.CardRow)}
+            assert str(rows["acme/infra#7"].query_one(".c-parent").render()) == "↳ platform #2 Reliable rollouts"
+            assert str(rows["acme/charts#3"].query_one(".c-parent").render()) == ""
+
+    asyncio.run(scenario())
+
+
+def test_tui_list_view_groups_by_parent_issue_and_the_board_does_not():
+    from tavla import tui
+
+    async def scenario():
+        app = tui.BoardApp()
+        async with app.run_test(size=(190, 45)) as pilot:
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            await pilot.press("g", "g")  # the board has two groupings
+            await pilot.pause()
+            assert app.grouping == "status"
+            await pilot.press("v", "g", "g")
+            await pilot.pause()
+            assert app.grouping == "parent" and "grouped by parent issue" in str(app.query_one("#status").render())
+            heads = [(r.group["title"], r.group["count"], str(r.query_one(".group-note").render())) for r in app.query(tui.GroupRow)]
+            assert heads == [("Reliable rollouts", 1, "platform #2  ☑ 1/4"), ("Assigned but untouched", 2, "infra #9  ☑ 0/1"), ("No parent", 1, ""), ("Unlinked", 1, "")]
+            rows = {r.card["key"]: r for r in app.query(tui.CardRow)}
+            cells = [str(lb.render()) for lb in rows["acme/infra#7"].query("Label")]
+            assert "Blocked" in cells and not any("Reliable" in c for c in cells)  # the heading names the parent, the row keeps its status
+            await pilot.press("v")  # back on the board the columns are by status again
+            await pilot.pause()
+            assert app.grouping == "status" and app.query_one("#count-blocked")
+
+    asyncio.run(scenario())
+
+
+def test_tui_parents_on_the_board_get_distinct_colours():
+    from tavla import tui
+
+    keys = [f"acme/infra#{n}" for n in range(1, 9)]
+    tui.assign_parent_colors([{"parent": {"key": k}} for k in keys] + [{"parent": None}])
+    assert len({tui.parent_color(k) for k in keys}) == 8
+    first = {k: tui.parent_color(k) for k in keys}
+    tui.assign_parent_colors([{"parent": {"key": k}} for k in reversed(keys)])
+    assert {k: tui.parent_color(k) for k in keys} == first  # the same set of parents gets the same colours

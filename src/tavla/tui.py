@@ -8,6 +8,7 @@ import shlex
 import subprocess
 import sys
 import tempfile
+import zlib
 from contextlib import suppress
 from pathlib import Path
 from typing import ClassVar
@@ -28,6 +29,9 @@ COL_MIN = 36  # five board columns at this width fit a 190-wide terminal
 GLYPH = {"needs": "●", "working": "◐", "idle": "○"}
 SESSION_COLOR = {"needs": "$warning", "working": "$accent", "idle": "$text-muted"}
 MERGED = "#a371f7"
+# One per parent issue on the board; past eight parents, colours are shared.
+PARENT_COLORS = ["#6cb6ff", "#f69d50", "#dcbdfb", "#57c4b8", "#f47067", "#c6d05a", "#e275ad", "#96a8f8"]
+GROUPINGS = {"status": "issue status", "session": "session state", "parent": "parent issue"}
 TAVLA = Theme(
     name="tavla",
     primary="#71bc6d",
@@ -97,6 +101,45 @@ def card_meta(card: dict, grouping: str) -> str:
     return "  ".join(p for p in parts if p)
 
 
+def short_ref(key: str, near: str = "") -> str:
+    """repo #N, or just #N for an issue in the same repository as the one it is shown on."""
+    repo, num = key.split("#")
+    return f"#{num}" if near and repo == near.split("#")[0] else f"{repo.split('/', 1)[1]} #{num}"
+
+
+parent_slots: dict[str, int] = {}
+
+
+def assign_parent_colors(cards: list[dict]) -> None:
+    """Give each parent its hashed colour, or the next free one when another parent on the board has it.
+
+    A parent keeps its colour between runs as long as the set of parents does not change around it."""
+    parent_slots.clear()
+    for key in sorted({c["parent"]["key"] for c in cards if c.get("parent")}):
+        slot = zlib.crc32(key.encode()) % len(PARENT_COLORS)
+        free = [(slot + i) % len(PARENT_COLORS) for i in range(len(PARENT_COLORS)) if (slot + i) % len(PARENT_COLORS) not in parent_slots.values()]
+        parent_slots[key] = free[0] if free else slot
+
+
+def parent_color(key: str) -> str:
+    return PARENT_COLORS[parent_slots.get(key, zlib.crc32(key.encode()) % len(PARENT_COLORS))]
+
+
+def parent_chip(card: dict) -> str:
+    parent = card.get("parent")
+    if not parent:
+        return ""
+    return f"[{parent_color(parent['key'])}]↳ {escape(short_ref(parent['key'], card['key']))} {escape(parent['title'])}[/]"
+
+
+def group_note(parent: dict | None) -> str:
+    if not parent:
+        return ""
+    sub = parent.get("subIssues") or {}
+    progress = f"  [$text-muted]☑ {sub['completed']}/{sub['total']}[/]" if sub.get("total") else ""
+    return f"[{parent_color(parent['key'])}]{escape(short_ref(parent['key']))}[/]{progress}"
+
+
 def labels_line(card: dict) -> str:
     return " ".join(label_chip(lb["name"], lb["color"]) for lb in card.get("labels") or [])
 
@@ -163,6 +206,8 @@ class CardItem(ListItem):
             Label(escape(card["title"]), classes="card-title"),
             Horizontal(Label(icon, classes="card-icon"), IssueLink(ref, url=card["url"], tooltip="Open on GitHub"), classes="card-ref"),
         ]
+        if parent := parent_chip(card):
+            rows.append(Label(parent, classes="card-parent"))
         if meta := card_meta(card, grouping):
             rows.append(Label(meta, classes="card-meta"))
         if labels := labels_line(card):
@@ -213,7 +258,12 @@ class GroupRow(ListItem):
     def __init__(self, group: dict) -> None:
         self.group = group
         super().__init__(
-            Horizontal(Label(group["title"], classes="col-title"), Label(str(group["count"]), classes="col-count"), classes="col-header"),
+            Horizontal(
+                Label(escape(group["title"]), classes="col-title"),
+                Label(str(group["count"]), classes="col-count"),
+                Label(group.get("note", ""), classes="group-note"),
+                classes="col-header",
+            ),
             classes="group-row alert" if group["alert"] else "group-row",
             disabled=True,
         )
@@ -235,6 +285,7 @@ class CardRow(ListItem):
                 Label(session_chip(card), classes="c-sessions"),
                 Label(pr_chip(card.get("prs") or []), classes="c-prs"),
                 Label(f"☑ {sub['completed']}/{sub['total']}" if sub.get("total") else "", classes="c-sub"),
+                Label("" if grouping == "parent" else parent_chip(card), classes="c-parent"),
                 Label(labels_line(card), classes="c-labels"),
             ),
             classes=" ".join(["row"] + ["is-hidden"] * bool(card.get("hidden")) + ["is-backlog"] * is_backlog(card, grouping)),
@@ -256,6 +307,7 @@ class SessRow(ListItem):
                 Label(f"[{SESSION_COLOR[kind]}]{escape(sess['state'])}[/]", classes="c-sessions"),
                 Label("", classes="c-prs"),
                 Label("", classes="c-sub"),
+                Label("", classes="c-parent"),
                 Label(escape(", ".join(sess["refs"])), classes="c-labels muted"),
             ),
             classes="row",
@@ -331,8 +383,8 @@ class GroupedList(CardList):
             self.screen.focus_previous()
 
 
-LIST_HEADER = ["", "Issue", "Repo", "Status", "Sessions", "PRs", "Sub", "Labels"]
-LIST_CELLS = ["c-icon", "c-title", "c-ref", "c-status", "c-sessions", "c-prs", "c-sub", "c-labels"]
+LIST_HEADER = ["", "Issue", "Repo", "Status", "Sessions", "PRs", "Sub", "Parent", "Labels"]
+LIST_CELLS = ["c-icon", "c-title", "c-ref", "c-status", "c-sessions", "c-prs", "c-sub", "c-parent", "c-labels"]
 SESS_HEADER = ["State", "Session", "Updated", "Id", "PRs", "Result"]
 SESS_CELLS = ["s-state", "s-name", "s-ago", "s-id", "s-prs", "s-result"]
 
@@ -562,6 +614,7 @@ class BoardApp(App):
     .card-icon {{ width: auto; margin-right: 1; }}
     .card-ref Link {{ width: auto; color: $text-muted; text-style: none; }}
     .card-ref Link:hover {{ color: $accent; text-style: underline; }}
+    .card-parent {{ width: 1fr; height: 1; text-wrap: nowrap; text-overflow: ellipsis; }}
     .card-meta, .card-labels, .card-body {{ width: 1fr; margin-top: 1; }}
     ListView.cards > ListItem.is-hidden {{ text-opacity: 50%; }}
     ListView.cards > ListItem.divider {{ height: 1; padding: 0 1; margin-bottom: 1; background: transparent; }}
@@ -583,6 +636,7 @@ class BoardApp(App):
     ListView.cards > ListItem.group-row {{ height: 1; margin-top: 1; padding: 0 1; background: transparent; }}
     ListView.cards > ListItem.group-row:first-child {{ margin-top: 0; }}
     ListItem.group-row .col-header {{ margin: 0; padding: 0; }}
+    .group-note {{ width: auto; margin-left: 1; }}
     .group-row.alert .col-title {{ color: $warning; }}
     .group-row.alert .col-count {{ background: $warning 30%; color: $warning; }}
     .row Horizontal, .list-head {{ height: 1; }}
@@ -597,7 +651,8 @@ class BoardApp(App):
     .c-sessions {{ width: 24; }}
     .c-prs {{ width: 16; }}
     .c-sub {{ width: 7; }}
-    .c-labels {{ width: 30; margin-right: 0; }}
+    .c-parent {{ width: 28; }}
+    .c-labels {{ width: 22; margin-right: 0; }}
     .s-state {{ width: 12; }}
     .s-name {{ width: 3fr; min-width: 16; }}
     .s-ago {{ width: 7; }}
@@ -657,7 +712,7 @@ class BoardApp(App):
 
     def compose(self) -> ComposeResult:
         yield Static("loading…", id="status")
-        filter_box = FilterInput(placeholder="filter: every word must match a title, repo #N, status, label or session name; recently closed issues match too", id="filter")
+        filter_box = FilterInput(placeholder="filter: every word must match a title, repo #N, status, label, parent issue or session name; recently closed issues match too", id="filter")
         filter_box.show(False)
         yield filter_box
         yield Columns(id="columns")
@@ -713,6 +768,7 @@ class BoardApp(App):
 
     async def show_board(self, data: dict) -> None:
         self.data = data
+        assign_parent_colors([c for c in data["cards"] if not c.get("searchOnly")])
         await self.fill_columns()
         self.update_status()
 
@@ -726,8 +782,7 @@ class BoardApp(App):
     def update_status(self) -> None:
         d = self.data
         state = "refreshing…" if self.loading else f"updated {core.ago(d['fetchedAt'])} ago" if d["fetchedAt"] else "loading…"
-        group = "issue status" if self.grouping == "status" else "session state"
-        group = f"{self.view} view  ·  grouped by {group}"
+        group = f"{self.view} view  ·  grouped by {GROUPINGS[self.grouping]}"
         if self.filter:
             shown = sum(1 for c in self.visible(d["cards"]) if self.show_hidden or c["key"] not in self.hidden)
             group += f"  ·  filter [$accent]{escape(self.filter)}[/]: {shown} of {plural(len(d['cards']), 'issue')}"
@@ -794,12 +849,11 @@ class BoardApp(App):
             return [r for r in rows if core.matches(r, self.filter)]
         return [r for r in rows if not r.get("searchOnly")]
 
-    def groups(self) -> list[tuple[str, str, list[dict]]]:
+    def groups(self) -> list[dict]:
         cards = [{**c, "hidden": True} if c["key"] in self.hidden else c for c in self.visible(self.data["cards"])]
         if not self.show_hidden:
             cards = [c for c in cards if not c.get("hidden")]
-        out = [(col_id, title, core.column_cards(cards, col_id, self.grouping)) for col_id, title in core.columns(self.grouping)]
-        return [*out, ("unlinked", "Unlinked", self.visible(self.data["unlinked"]))]
+        return [*core.groups(cards, self.grouping), {"id": "unlinked", "title": "Unlinked", "parent": None, "cards": self.visible(self.data["unlinked"])}]
 
     @staticmethod
     def group_alert(col_id: str, rows: list[dict]) -> bool:
@@ -807,9 +861,10 @@ class BoardApp(App):
 
     async def fill_list(self, keep: str | None) -> None:
         rows: list[dict] = []
-        for col_id, title, members in self.groups():
+        for group in self.groups():
+            col_id, title, members = group["id"], group["title"], group["cards"]
             if members:
-                rows.append({"group": col_id, "title": title, "count": len(members), "alert": self.group_alert(col_id, members)})
+                rows.append({"group": col_id, "title": title, "count": len(members), "alert": self.group_alert(col_id, members), "note": group_note(group["parent"])})
                 rows.extend(m if "divider" in m else {**m, "groupTitle": title} for m in with_divider(members, self.grouping))
 
         def make(r: dict) -> ListItem:
@@ -829,7 +884,8 @@ class BoardApp(App):
         if self.view == "list":
             await self.fill_list(keep)
             return
-        for col_id, _, rows in self.groups():
+        for group in self.groups():
+            col_id, rows = group["id"], group["cards"]
             lv = self.query_one(f"#col-{col_id}", ListView)
             if col_id == "unlinked":
                 await self.replace_items(lv, rows, SessItem, keep)
@@ -1025,13 +1081,17 @@ class BoardApp(App):
                 return
 
     async def action_group(self) -> None:
-        self.grouping = "session" if self.grouping == "status" else "status"
+        # By parent issue is a list grouping: its groups come and go with the issues, and the board's columns are fixed.
+        order = [g for g in GROUPINGS if g != "parent" or self.view == "list"]
+        self.grouping = order[(order.index(self.grouping) + 1) % len(order)]
         await self.build_columns()
         await self.fill_columns()
         self.update_status()
 
     async def action_view(self) -> None:
         self.view = "list" if self.view == "board" else "board"
+        if self.view == "board" and self.grouping == "parent":
+            self.grouping = "status"
         await self.build_columns()
         await self.fill_columns()
         self.update_status()

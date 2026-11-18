@@ -79,7 +79,7 @@ While it runs, the terminal tab is named "Tavla"; the previous name comes back o
 |---|---|
 | arrows / tab | Move between cards and columns (in the list view, tab jumps between groups) |
 | `home` / `end` | Jump to the first / last card in a column, row in the list view, or session in the sessions panel |
-| `/` | Search: filters the board and the list as you type. Every word must appear in an issue's title, `repo#N`, status, labels or session names (an unlinked session's name, id or refs), ignoring case. A search also finds finished issues that are off the board: yours closed in the last 30 days, and older ones a session still links to. They show in Done (or by their session state) while the filter is on, and every key works on them, so `n` starts a follow-up session. `enter` moves to the first match and keeps the filter on; `esc` in the box clears it. The status line shows how many issues match |
+| `/` | Search: filters the board and the list as you type. Every word must appear in an issue's title, `repo#N`, status, labels, parent issue (its title or `repo#N`) or session names (an unlinked session's name, id or refs), ignoring case. A search also finds finished issues that are off the board: yours closed in the last 30 days, and older ones a session still links to. They show in Done (or by their session state) while the filter is on, and every key works on them, so `n` starts a follow-up session. `enter` moves to the first match and keeps the filter on; `esc` in the box clears it. The status line shows how many issues match |
 | `enter` | On a card: focus its sessions. On a session: attach in a new terminal tab. On a deleted session (under the `Deleted` divider in the sessions panel): resume it as a background session under the same id, put it back on its issue, and attach |
 | `n` | New background session on the selected issue (asks for an optional prompt). On a Todo or Backlog issue the box also offers to move it to In Progress on the project its status comes from: ticked by default for Todo, unticked for Backlog. A checkbox at the bottom, unticked by default, attaches to the new session in a new terminal tab. With no issue card selected (an unlinked session, or nothing) it does what `N` does |
 | `N` | New background session on no issue: asks for a prompt (required), lets Claude Code name the session, and it shows under Unlinked. The same attach checkbox as `n` |
@@ -89,19 +89,21 @@ While it runs, the terminal tab is named "Tavla"; the previous name comes back o
 | `h` | Hide the selected issue from the board and the list, or unhide it. Kept locally in `~/.config/tavla/hidden.json` |
 | `H` | Show or leave out hidden issues (left out at every start). Shown, a hidden card is dimmed and tagged `⊘ hidden`; the status line counts the hidden issues |
 | `o` | Open the issue in the browser |
-| `g` | Group by issue status or by session state |
-| `v` | Switch between the board (columns) and a grouped list |
+| `g` | Group by issue status or by session state; the list view adds a third grouping, by parent issue |
+| `v` | Switch between the board (columns) and a grouped list. Leaving the list while it is grouped by parent issue puts the board back on issue status |
 | `r` | Refresh now (also bypasses the project status cache) |
 | `esc` | Back to the columns |
 | `q` | Quit |
 
 The footer shows the common keys and is cut off at the right edge when the terminal is narrower than they need; `ctrl+p` → Keys lists every key.
 
-Each card shows the issue title, then `repo #number` (click it to open the issue); clicking elsewhere on a card selects it and keeps the focus on the board, then indicators: session state (`● needs you`, `◐ working`, `○ N sessions`), PRs (`⎇ N PRs`, green while any is open, purple once merged), sub-issue progress (`☑ done/total`), and the issue's labels in their GitHub colors.
+Each card shows the issue title, then `repo #number` (click it to open the issue); clicking elsewhere on a card selects it and keeps the focus on the board. A sub-issue names its parent on the next line (`↳ repo #N title`, or `↳ #N title` when the parent is in the same repository), in the parent's colour, so sibling cards look alike across the columns; each parent on the board has its own colour while there are eight or fewer. Then indicators: session state (`● needs you`, `◐ working`, `○ N sessions`), PRs (`⎇ N PRs`, green while any is open, purple once merged), sub-issue progress (`☑ done/total`), and the issue's labels in their GitHub colors.
 
 Below the board, the left panel shows the highlighted issue's body as Markdown (scroll it with the mouse; links open in the browser), or an unlinked session's first prompt; the right panel lists its sessions one per line: state, name, last update, id, PRs and the start of the result. Sessions that were on the issue and are gone come last, dimmed, under a `Deleted N` divider: deleted background sessions (`◌ deleted`) and interactive ones that ended (`◌ ended`). `enter` resumes one; the other session keys (`l`, `u`, `ctrl+x`) leave them alone. They place no card and count in no badge.
 
-The list view puts each issue on one line under its group's heading (same groups as the columns, empty ones left out), with Repo, Status, Sessions, PRs, Sub and Labels cells sized for a terminal about 190 columns wide; the title cell absorbs the difference. Status is left blank where the group heading already says it.
+The list view puts each issue on one line under its group's heading (same groups as the columns, empty ones left out), with Repo, Status, Sessions, PRs, Sub, Parent and Labels cells sized for a terminal about 190 columns wide; the title cell absorbs the difference. Status is left blank where the group heading already says it.
+
+Grouped by parent issue, the list has one group per parent, in the order of their first card: the heading is the parent's title, then its `repo #N` and its own sub-issue progress (all its sub-issues, not only yours). A parent that has a card of its own leads its group. Issues with no parent and no sub-issue on the board come last, under `No parent`, and the Parent cell is left blank.
 
 In the text boxes (prompt, issue title and body, search), `option+left` / `option+right` move by word and add `shift` to select; in the prompt and issue body, `option+up` / `option+down` jump to the start / end of the text, and `ctrl+g` opens the text in `$VISUAL` (else `$EDITOR`, else `vi`) and takes it back when the editor exits, which is also how to write a prompt with several lines, since `enter` starts the session. A GUI editor needs its wait flag, e.g. `EDITOR="code --wait"`.
 
@@ -116,7 +118,7 @@ Attaching opens a new tab in the current iTerm2 or Ghostty window (the `terminal
 The app is built on `src/tavla/board.py`; `tavla` with a command runs it directly:
 
 ```sh
-tavla dump [--group session] [--force]
+tavla dump [--group session|parent] [--force]
 tavla json
 tavla attach <session>
 tavla new <issue> [prompt...]
@@ -153,7 +155,7 @@ Both need the `tavla` command on `PATH`.
 - **Startup and no network:** the caches are kept between runs, so the board is drawn from them (any age) the moment `tavla` starts, with `refreshing…` in the status line until GitHub answers and replaces it. When GitHub can't be reached, each list keeps its last cached answer and the status line shows the error; every refresh (once a minute) asks again, so the board catches up by itself when the network is back.
 - **Sessions:** `~/.claude/jobs/*/state.json` for background sessions (`name`, `state`, `intent` = first prompt, `children` = linked PRs, `output.result`), plus `claude agents --json` for interactive ones. The job files are Claude Code internals and may change between versions.
 - **Deleted sessions:** every session seen on a card is recorded in `~/.config/tavla/history.json` (ids, name, directory, issues, PRs, start of the result). `claude rm` removes a session from the list but keeps its conversation under `~/.claude/projects/`, so a recorded session that is no longer listed is shown under its issues as deleted, and `claude --bg --resume <session id>`, run in the session's own directory (`session_dir` when that is gone), brings it back under the same id. Sessions deleted before they were recorded are picked up once from the links they left in `links.json`, with the name and directory read from the conversation file; one whose conversation is gone is not shown. A deleted session shows only on an issue that has a card, and a search matches its name.
-- **Card metadata:** labels, sub-issue progress, the issue body and closing PRs come from the same batched GraphQL calls; a card's PRs are its closing PRs plus the PRs of the sessions on it.
+- **Card metadata:** labels, sub-issue progress, the parent issue (title, state and its sub-issue progress), the issue body and closing PRs come from the same batched GraphQL calls; a card's PRs are its closing PRs plus the PRs of the sessions on it.
 - **Session to issue:** manual links (`~/.config/tavla/links.json`), issue/PR URLs or `owner/repo#N` in the first prompt, and the issues each linked PR closes (one batched GraphQL call).
 - **Columns by issue status:** Todo (No status, Backlog and Todo together; Backlog cards come last, under a `Backlog N` divider line and with a dimmed title, in the board and the list), In Progress, Blocked, Done. A closed issue counts as Done, and Done cards show only while a session on them is live or was touched in the last 3 days; after that a search still finds them. Each card carries a session badge (`!` needs you, `~` working, `Ns/M live`), and cards needing you sort first.
 - **Columns by session state:** Active (sessions that need you or are working; needs-you cards first, and the header is highlighted while any card needs you), Idle, No session.

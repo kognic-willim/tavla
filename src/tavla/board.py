@@ -412,10 +412,12 @@ def find_sessions(sessions: list[dict], needle: str) -> list[dict]:
 
 
 def search_text(row: dict) -> str:
-    """What a filter matches on: a card's title, repo#N, status, labels and session names; a session's name, id and refs."""
+    """What a filter matches on: a card's title, repo#N, status, labels, parent issue (title and repo#N) and session names; a session's name, id and refs."""
     if "sessions" in row:
         names = [s["name"] for s in [*row["sessions"], *row.get("pastSessions", [])]]
-        parts = [row["title"], row["key"], row["key"].split("/", 1)[1], row["status"], *(lb["name"] for lb in row.get("labels") or []), *names]
+        parent = row.get("parent") or {}
+        up = [parent["title"], parent["key"], parent["key"].split("/", 1)[1]] if parent else []
+        parts = [row["title"], row["key"], row["key"].split("/", 1)[1], row["status"], *(lb["name"] for lb in row.get("labels") or []), *up, *names]
     else:
         parts = [row["name"], row["id"], *row.get("refs", [])]
     return " ".join(p for p in parts if p).lower()
@@ -591,18 +593,29 @@ def resolve_refs(refs: list[Ref], errors: list[str], force: bool = False, offlin
 def _fetch_refs(uniq: list[Ref], errors: list[str]) -> dict[str, dict]:
     out: dict[str, dict] = {}
     pr_fields = "number state url repository { nameWithOwner }"
+    parent_fields = "number title url state repository { nameWithOwner } subIssuesSummary { total completed }"
     fields = (
         "number title body url state updatedAt repository { nameWithOwner }"
         " labels(first: 6) { nodes { name color } } subIssuesSummary { total completed }"
         " assignees(first: 3) { nodes { login } }"
+        f" parent {{ {parent_fields} }}"
         f" closedByPullRequestsReferences(first: 10, includeClosedPrs: true) {{ nodes {{ {pr_fields} }} }}"
     )
 
     def to_pr(n: dict) -> dict:
         return {"key": f"{n['repository']['nameWithOwner']}#{n['number']}".lower(), "url": n["url"], "state": n["state"]}
 
-    def to_issue(n: dict) -> dict:
+    def sub_issues(n: dict) -> dict:
         sub = n.get("subIssuesSummary") or {}
+        return {"total": sub.get("total") or 0, "completed": sub.get("completed") or 0}
+
+    def to_parent(n: dict | None) -> dict | None:
+        if not n:
+            return None
+        key = f"{n['repository']['nameWithOwner']}#{n['number']}".lower()
+        return {"key": key, "title": n["title"], "url": n["url"], "isOpen": n["state"] == "OPEN", "subIssues": sub_issues(n)}
+
+    def to_issue(n: dict) -> dict:
         return {
             "kind": "Issue",
             "key": f"{n['repository']['nameWithOwner']}#{n['number']}".lower(),
@@ -612,7 +625,8 @@ def _fetch_refs(uniq: list[Ref], errors: list[str]) -> dict[str, dict]:
             "isOpen": n["state"] == "OPEN",
             "updatedAt": parse_time_ms(n.get("updatedAt")),
             "labels": [{"name": lb["name"], "color": lb["color"]} for lb in (n.get("labels") or {}).get("nodes") or []],
-            "subIssues": {"total": sub.get("total") or 0, "completed": sub.get("completed") or 0},
+            "subIssues": sub_issues(n),
+            "parent": to_parent(n.get("parent")),
             "assignees": [a["login"] for a in (n.get("assignees") or {}).get("nodes") or []],
             "prs": [to_pr(p) for p in (n.get("closedByPullRequestsReferences") or {}).get("nodes") or []],
         }
@@ -778,6 +792,7 @@ def _build_board(force: bool, offline: bool) -> dict:
                 "prs": list(prs.values()),
                 "labels": m.get("labels", []),
                 "subIssues": m.get("subIssues", {"total": 0, "completed": 0}),
+                "parent": m.get("parent"),
                 "assignees": m.get("assignees", []),
                 "body": m.get("body", ""),
             }
@@ -809,6 +824,42 @@ def column_cards(cards: list[dict], col_id: str, grouping: str) -> list[dict]:
     return members
 
 
+NO_PARENT = ("none", "No parent")
+
+
+def parent_groups(cards: list[dict]) -> list[dict]:
+    """The cards under their parent issue, in board order: {"id", "title", "parent", "cards"} per parent.
+
+    A card that is itself the parent of another card leads that group; cards with neither come last, under No parent."""
+    by_key = {c["key"]: c for c in cards}
+    heads = {c["parent"]["key"]: c["parent"] for c in cards if c.get("parent")}
+    groups: dict[str, dict] = {}
+    loose = []
+    for c in cards:
+        gid = c["parent"]["key"] if c.get("parent") else c["key"] if c["key"] in heads else None
+        if gid is None:
+            loose.append(c)
+            continue
+        group = groups.setdefault(gid, {"id": gid, "title": heads[gid]["title"], "parent": heads[gid], "cards": []})
+        group["cards"].append(c)
+    for gid, group in groups.items():
+        if gid in by_key:
+            group["cards"].sort(key=lambda c: c["key"] != gid)
+    return [*groups.values(), {"id": NO_PARENT[0], "title": NO_PARENT[1], "parent": None, "cards": loose}]
+
+
+def groups(cards: list[dict], grouping: str) -> list[dict]:
+    """Every group of a grouping with its cards: the fixed columns by status or session, one group per parent issue by parent."""
+    if grouping == "parent":
+        return parent_groups(cards)
+    return [{"id": col_id, "title": title, "parent": None, "cards": column_cards(cards, col_id, grouping)} for col_id, title in columns(grouping)]
+
+
+def parent_note(parent: dict) -> str:
+    sub = parent.get("subIssues") or {}
+    return parent["key"] + (f" {sub['completed']}/{sub['total']} done" if sub.get("total") else "")
+
+
 def badge(card: dict) -> str:
     ss = card["sessions"]
     if not ss:
@@ -826,9 +877,12 @@ def ago(ms: int) -> str:
 def summary(board: dict, grouping: str) -> str:
     lines = []
     on_board = [c for c in board["cards"] if not c.get("searchOnly")]
-    for col_id, title in columns(grouping):
-        cs = column_cards(on_board, col_id, grouping)
-        lines.append(f"## {title} ({len(cs)})")
+    for group in groups(on_board, grouping):
+        cs = group["cards"]
+        if grouping == "parent" and not cs:
+            continue
+        note = f" [{parent_note(group['parent'])}]" if group["parent"] else ""
+        lines.append(f"## {group['title']} ({len(cs)}){note}")
         for c in cs:
             tag = badge(c) if grouping == "status" else c["status"]
             lines.append(f"- {c['key']} {c['title']}" + (f" [{tag}]" if tag else ""))
@@ -1075,7 +1129,7 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("json", help="print the board as JSON")
     p.add_argument("--force", action="store_true", help="bypass the project status cache")
     p = sub.add_parser("dump", help="print the board as text")
-    p.add_argument("--group", choices=["status", "session"], default="status")
+    p.add_argument("--group", choices=["status", "session", "parent"], default="status")
     p.add_argument("--force", action="store_true")
     p = sub.add_parser("attach", help="attach to a session in a new terminal tab")
     p.add_argument("session")
