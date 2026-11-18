@@ -579,7 +579,13 @@ def resolve_refs(refs: list[Ref], errors: list[str], force: bool = False, offlin
         cache = {}
     now = time.time()
     uniq = list({key_of(r): r for r in refs}.values())
-    stale = [] if offline else [r for r in uniq if force or now - cache.get(key_of(r), {}).get("at", 0) >= META_TTL_S]
+
+    def outdated(entry: dict) -> bool:
+        """Cached before the parent issue was fetched: asked again at once, whatever its age."""
+        info = entry.get("info") or {}
+        return any("parent" not in i for i in ([info] if info.get("kind") == "Issue" else info.get("closes") or []))
+
+    stale = [] if offline else [r for r in uniq if force or now - cache.get(key_of(r), {}).get("at", 0) >= META_TTL_S or outdated(cache[key_of(r)])]
     fetched = _fetch_refs(stale, errors)
     for r in stale:
         if key_of(r) in fetched or key_of(r) not in cache:

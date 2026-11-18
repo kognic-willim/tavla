@@ -1789,3 +1789,17 @@ def test_tui_parents_on_the_board_get_distinct_colours():
     first = {k: tui.parent_color(k) for k in keys}
     tui.assign_parent_colors([{"parent": {"key": k}} for k in reversed(keys)])
     assert {k: tui.parent_color(k) for k in keys} == first  # the same set of parents gets the same colours
+
+
+def test_metadata_cached_without_a_parent_is_fetched_again_at_once():
+    core.build_board()
+    cache_file = core.CONFIG / "meta-cache.json"
+    cache = json.loads(cache_file.read_text())
+    del cache["acme/infra#7"]["info"]["parent"]  # as a version before parents wrote it
+    cache_file.write_text(json.dumps(cache))
+    GRAPHQL_CALLS.clear()
+    cards = {c["key"]: c for c in core.build_board()["cards"]}
+    assert GRAPHQL_CALLS.count("refs") == 1 and cards["acme/infra#7"]["parent"]["key"] == "acme/platform#2"
+    GRAPHQL_CALLS.clear()
+    core.build_board()
+    assert "refs" not in GRAPHQL_CALLS  # and then it is cached like the rest
