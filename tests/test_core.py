@@ -204,6 +204,81 @@ def test_paused_board_links_sessions_from_cached_github_data(monkeypatch):
     assert [s["id"] for s in paused["unlinked"]] == [s["id"] for s in online["unlinked"]]
 
 
+def test_unreachable_github_keeps_the_cached_board(monkeypatch):
+    online = core.build_board()
+
+    def no_network(argv, timeout=60, cwd=None):
+        if argv[0] == "gh":
+            raise RuntimeError("gh search issues: error connecting to api.github.com")
+        return fake_run(argv, timeout, cwd)
+
+    def no_graphql(query, variables=None):
+        raise json.JSONDecodeError("no answer", "", 0)
+
+    monkeypatch.setattr(core, "run", no_network)
+    monkeypatch.setattr(core, "graphql", no_graphql)
+    offline = core.build_board(force=True)  # every cache is asked to refresh, and none can
+
+    def strip(b):
+        return [(c["key"], c["status"], c["statusItem"], [s["id"] for s in c["sessions"]]) for c in b["cards"]]
+
+    assert strip(offline) == strip(online)
+    assert any("not readable" in e for e in offline["errors"])
+    assert not core.backoff_until()  # a dead network is not a rate limit: the next refresh asks again
+
+
+def test_one_unreadable_project_keeps_its_cached_statuses(monkeypatch):
+    core.build_board()
+    monkeypatch.setitem(PROJECTS, "me", [item("acme/infra", 11, "Personal todo", "In progress")])
+
+    def team_down(query, variables=None):
+        return {} if "projectV2" in query and variables["owner"] == "team" else fake_graphql(query, variables)
+
+    monkeypatch.setattr(core, "graphql", team_down)
+    status = {c["key"]: c["status"] for c in core.build_board(force=True)["cards"]}
+    assert status["acme/infra#11"] == "In progress"  # the readable project is fresh
+    assert status["acme/infra#7"] == "Blocked"  # the unreadable one keeps its last answer
+
+
+def test_tui_draws_the_cached_board_before_github_answers(monkeypatch):
+    import threading
+
+    from tavla import tui
+
+    core.build_board()  # an earlier run left its caches
+    for name in ("assigned", "projects", "closed"):  # long expired, as at a morning's first start
+        cache = json.loads((core.CONFIG / f"{name}-cache.json").read_text())
+        (core.CONFIG / f"{name}-cache.json").write_text(json.dumps({**cache, "at": 0}))
+    release = threading.Event()
+
+    def slow_graphql(query, variables=None):
+        release.wait(10)
+        return fake_graphql(query, variables)
+
+    monkeypatch.setattr(core, "graphql", slow_graphql)
+    monkeypatch.setitem(PROJECTS, "team", [item("acme/infra", 7, "Deploy is flaky", "In progress")])
+
+    async def scenario():
+        app = tui.BoardApp()
+        async with app.run_test(size=(180, 40)) as pilot:
+            for _ in range(100):
+                if app.data["cards"]:
+                    break
+                await pilot.pause(0.05)
+            assert str(app.query_one("#count-blocked").render()) == "1"  # the cached status, while GitHub is still out
+            assert "refreshing" in str(app.query_one("#status").render())
+            release.set()
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            assert str(app.query_one("#count-blocked").render()) == "0"  # the refresh replaced it
+            assert "updated" in str(app.query_one("#status").render())
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        release.set()
+
+
 def test_exhausted_graphql_budget_pauses_until_its_reset(monkeypatch):
     (core.CONFIG).mkdir(parents=True, exist_ok=True)
 

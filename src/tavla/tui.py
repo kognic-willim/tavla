@@ -8,6 +8,7 @@ import shlex
 import subprocess
 import sys
 import tempfile
+from contextlib import suppress
 from pathlib import Path
 from typing import ClassVar
 
@@ -698,17 +699,26 @@ class BoardApp(App):
     # Its own group: exclusive cancels the group, and a start or delete worker asks for this refresh mid-run.
     @work(thread=True, exclusive=True, group="load")
     def load(self, force: bool) -> None:
+        if not self.data["fetchedAt"]:
+            # Startup: the cached board is drawn at once, and the refresh below replaces it when GitHub answers.
+            with suppress(Exception):
+                cached = core.cached_board()
+                if cached["cards"]:
+                    self.call_from_thread(self.show_board, cached)
         try:
             data = core.build_board(force)
         except Exception as err:  # noqa: BLE001
             data = {**self.data, "errors": [str(err)]}
         self.call_from_thread(self.apply, data)
 
-    async def apply(self, data: dict) -> None:
+    async def show_board(self, data: dict) -> None:
         self.data = data
-        self.loading = False
         await self.fill_columns()
         self.update_status()
+
+    async def apply(self, data: dict) -> None:
+        self.loading = False
+        await self.show_board(data)
         if self.refresh_queued is not None:
             force, self.refresh_queued = self.refresh_queued, None
             self.action_refresh(force)

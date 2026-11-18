@@ -513,7 +513,7 @@ def load_closed(force: bool, errors: list[str], offline: bool = False) -> list[d
 
 def load_projects(force: bool, errors: list[str], offline: bool = False) -> list[dict]:
     """Status is read from the project side: issue-side projectItems is empty for cross-org projects.
-    Offline, the cached lists are used whatever their age."""
+    Offline, the cached lists are used whatever their age, and so is the cached list of a project GitHub won't answer for."""
     cached, fresh = read_cache("projects-cache.json", PROJECT_TTL_S, force, offline)
     if fresh or offline:
         return cached or []
@@ -524,7 +524,12 @@ def load_projects(force: bool, errors: list[str], offline: bool = False) -> list
         items, cursor = [], None
         while True:
             variables = {"owner": p["owner"], "number": int(p["number"]), **({"cursor": cursor} if cursor else {})}
-            page = ((((graphql(PROJECT_QUERY, variables).get("data") or {}).get("repositoryOwner") or {}).get("projectV2") or {}).get("items")) or None
+            try:
+                page = ((((graphql(PROJECT_QUERY, variables).get("data") or {}).get("repositoryOwner") or {}).get("projectV2") or {}).get("items")) or None
+            except RateLimited:
+                raise
+            except Exception:  # noqa: BLE001 - no network, a timeout, an answer that isn't JSON
+                page = None
             if page is None:
                 errors.append(f"project {p['owner']}/{p['number']}: not readable")
                 return None
@@ -552,10 +557,13 @@ def load_projects(force: bool, errors: list[str], offline: bool = False) -> list
     # Projects in parallel, pages within one in order: the wall time is the longest project's pages.
     with ThreadPoolExecutor(len(PROJECTS)) as pool:
         lists = list(pool.map(fetch, PROJECTS))
-    items = [i for lst in lists if lst for i in lst]
     if all(lst is not None for lst in lists):
+        items = [i for lst in lists for i in lst]
         write_cache("projects-cache.json", items, errors)
-    return items
+        return items
+    # A project that can't be read (no network, a GitHub error) keeps its last cached list, in the projects' order.
+    last = cached or []
+    return [i for p, lst in zip(PROJECTS, lists) for i in (lst if lst is not None else [c for c in last if c.get("project") == f"{p['owner']}/{p['number']}"])]
 
 
 def resolve_refs(refs: list[Ref], errors: list[str], force: bool = False, offline: bool = False) -> dict[str, dict]:
@@ -660,6 +668,12 @@ def build_board(force: bool = False) -> dict:
     board["errors"].insert(0, f"GitHub rate limit: paused until {time.strftime('%H:%M:%S', time.localtime(until))}; showing cached GitHub data")
     board["isOffline"] = True
     return board
+
+
+def cached_board() -> dict:
+    """The board from the session files and cached GitHub data of any age, without calling GitHub:
+    what the app draws at startup, before its first refresh answers."""
+    return _build_board(False, offline=True)
 
 
 def _build_board(force: bool, offline: bool) -> dict:
