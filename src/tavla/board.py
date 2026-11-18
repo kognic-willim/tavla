@@ -32,6 +32,9 @@ ISSUE_REPOS: list[tuple[str, str]] = []
 # Where `new` starts background sessions.
 SESSION_CWD = Path.cwd()
 THEME = "tavla"
+# The terminal app `attach` opens tabs in.
+TERMINALS = {"iterm2": "iTerm2", "ghostty": "Ghostty"}
+TERMINAL = "ghostty" if os.environ.get("TERM_PROGRAM") == "ghostty" else "iterm2"
 PROJECT_TTL_S = 300
 ASSIGNED_TTL_S = 300  # open issues assigned to me
 META_TTL_S = 600  # issue/PR metadata: labels, sub-issues, linked PRs, open state
@@ -83,8 +86,8 @@ Ref = tuple[str, str, int]
 
 
 def load_config() -> None:
-    """Set PROJECTS, ISSUE_REPOS, SESSION_CWD and THEME from CONFIG/config.toml; a missing file leaves the defaults."""
-    global PROJECTS, ISSUE_REPOS, SESSION_CWD, THEME
+    """Set PROJECTS, ISSUE_REPOS, SESSION_CWD, THEME and TERMINAL from CONFIG/config.toml; a missing file leaves the defaults."""
+    global PROJECTS, ISSUE_REPOS, SESSION_CWD, THEME, TERMINAL
     path = CONFIG / "config.toml"
     try:
         cfg = tomllib.loads(path.read_text())
@@ -100,7 +103,10 @@ def load_config() -> None:
     bad = [r for r, _ in repos if not re.fullmatch(r"[\w.-]+/[\w.-]+", r)]
     if bad:
         raise ValueError(f"{path}: issue_repos repo must be owner/repo, got {bad[0]!r}")
-    PROJECTS, ISSUE_REPOS = projects, repos
+    terminal = str(cfg.get("terminal") or TERMINAL).lower()
+    if terminal not in TERMINALS:
+        raise ValueError(f"{path}: terminal must be one of {', '.join(TERMINALS)}, got {terminal!r}")
+    PROJECTS, ISSUE_REPOS, TERMINAL = projects, repos, terminal
     if cfg.get("session_dir"):
         SESSION_CWD = Path(str(cfg["session_dir"])).expanduser()
     THEME = str(cfg.get("theme") or THEME)
@@ -837,10 +843,28 @@ on run argv
   end tell
 end run
 """
+# Ghostty (1.3 or later) takes the command as the new shell's first input and the tab name as an override.
+GHOSTTY_SCRIPT = """
+on run argv
+  set cmd to item 1 of argv
+  set tabName to item 2 of argv
+  tell application "Ghostty"
+    activate
+    set cfg to new surface configuration
+    set initial input of cfg to cmd & linefeed
+    if (count of windows) = 0 then
+      set t to selected tab of (new window with configuration cfg)
+    else
+      set t to new tab in front window with configuration cfg
+    end if
+    set name override of t to tabName
+  end tell
+end run
+"""
 
 
 def attach(session_id: str, title: str = "", dry_run: bool = False, cwd: str = "") -> str:
-    """Open a new iTerm2 tab attached to the session; detaching leaves the tab's shell open.
+    """Open a new tab in TERMINAL attached to the session; detaching leaves the tab's shell open.
 
     The tab closes itself once the session is deleted: `claude attach` returns when its session is
     removed, and the shell then exits because the job directory is gone.
@@ -848,10 +872,11 @@ def attach(session_id: str, title: str = "", dry_run: bool = False, cwd: str = "
     The tab first moves to the session's own directory: waking a finished session starts Claude in
     the shell's directory, which in a new tab is the home directory. The tab is named with an OSC 1
     escape from its own shell, as iTerm2 does not show a name set through AppleScript, and Claude
-    Code's own terminal title is switched off so the tab keeps that name."""
+    Code's own terminal title is switched off so the tab keeps that name. Ghostty ignores the escape
+    and gets the name as a tab name override instead."""
     name = shlex.quote(title or session_id)
     cmd = f"printf '\\033]1;%s\\007' {name} && cd {shlex.quote(cwd or str(SESSION_CWD))} && CLAUDE_CODE_DISABLE_TERMINAL_TITLE=1 claude attach {session_id}; [ -d {shlex.quote(str(JOBS / session_id))} ] || exit"
-    argv = ["osascript", "-e", ITERM_SCRIPT, cmd]
+    argv = ["osascript", "-e", GHOSTTY_SCRIPT, cmd, title or session_id] if TERMINAL == "ghostty" else ["osascript", "-e", ITERM_SCRIPT, cmd]
     if not dry_run:
         run(argv, timeout=20)
     return cmd
@@ -1038,7 +1063,7 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("dump", help="print the board as text")
     p.add_argument("--group", choices=["status", "session"], default="status")
     p.add_argument("--force", action="store_true")
-    p = sub.add_parser("attach", help="attach to a session in a new iTerm2 tab")
+    p = sub.add_parser("attach", help="attach to a session in a new terminal tab")
     p.add_argument("session")
     p.add_argument("--dry-run", action="store_true")
     p = sub.add_parser("new", help="start a background session on an issue")

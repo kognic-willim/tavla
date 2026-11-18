@@ -448,7 +448,7 @@ class AskPrompt(ModalScreen[tuple[str, bool, bool] | None]):
             if self.progress_from:
                 yield Checkbox(f"Move the issue from {self.progress_from} to In Progress", value=self.progress_from == "Todo", id="to-progress")
             if self.offer_attach:
-                yield Checkbox("Attach to the session (new iTerm tab)", value=False, id="attach-now")
+                yield Checkbox("Attach to the session (new terminal tab)", value=False, id="attach-now")
 
     def action_submit(self) -> None:
         prompt = self.query_one("#prompt", TextArea).text.strip()
@@ -1003,7 +1003,7 @@ class BoardApp(App):
             return
         try:
             core.attach(sess["id"], sess["name"], cwd=sess.get("cwd") or "")
-            self.call_from_thread(self.notify, f"Attached {sess['id']} in a new iTerm2 tab")
+            self.call_from_thread(self.notify, f"Attached {sess['id']} in a new {core.TERMINALS[core.TERMINAL]} tab")
         except Exception as err:  # noqa: BLE001
             self.call_from_thread(self.notify, f"Attach failed: {err}", severity="error")
 
@@ -1199,17 +1199,19 @@ class BoardApp(App):
 def run(out=sys.stdout) -> None:
     """Name the terminal tab after the board while it runs, then restore the previous name.
 
-    The xterm title stack (CSI 22/23) saves and restores the name; OSC 1 sets iTerm2's tab title."""
+    The xterm title stack (CSI 22/23) saves and restores the name. OSC 1 sets iTerm2's tab title;
+    Ghostty names a tab after the window title, which is OSC 2."""
     try:
         core.load_config()
     except ValueError as err:
         sys.exit(f"error: {err}")
-    out.write(f"\x1b[22;1t\x1b]1;{BoardApp.TITLE}\x07")
+    osc = 2 if core.TERMINAL == "ghostty" else 1
+    out.write(f"\x1b[22;{osc}t\x1b]{osc};{BoardApp.TITLE}\x07")
     out.flush()
     try:
         BoardApp().run()
     finally:
-        out.write("\x1b[23;1t")
+        out.write(f"\x1b[23;{osc}t")
         out.flush()
 
 

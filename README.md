@@ -6,7 +6,7 @@ A terminal app to manage agent sessions: GitHub issues on a kanban board, each c
 
 ## Requirements
 
-- macOS with [iTerm2](https://iterm2.com): attaching to a session opens a new iTerm2 tab.
+- macOS with [iTerm2](https://iterm2.com) or [Ghostty](https://ghostty.org) 1.3 or later: attaching to a session opens a new tab there.
 - [Claude Code](https://claude.com/claude-code) as `claude` on `PATH`, a version with background sessions (`claude --bg`, `claude agents`).
 - [GitHub CLI](https://cli.github.com) as `gh`, signed in with the `project` scope so it can read and set project status: `gh auth refresh -s project`.
 - [uv](https://docs.astral.sh/uv/) to install it.
@@ -36,6 +36,10 @@ session_dir = "~/Code/my-notes"
 
 # "tavla" (the default) or any built-in Textual theme, e.g. "nord" or "textual-light".
 theme = "tavla"
+
+# Where attaching opens its tab: "iterm2" or "ghostty". Default: "ghostty" when tavla
+# runs inside Ghostty (TERM_PROGRAM), otherwise "iterm2".
+terminal = "ghostty"
 
 # GitHub Projects whose Status field places a card in a column, in precedence order:
 # the first project that holds the issue wins. The non-Done items of a project marked
@@ -76,8 +80,8 @@ While it runs, the terminal tab is named "Tavla"; the previous name comes back o
 | arrows / tab | Move between cards and columns (in the list view, tab jumps between groups) |
 | `home` / `end` | Jump to the first / last card in a column, row in the list view, or session in the sessions panel |
 | `/` | Search: filters the board and the list as you type. Every word must appear in an issue's title, `repo#N`, status, labels or session names (an unlinked session's name, id or refs), ignoring case. A search also finds finished issues that are off the board: yours closed in the last 30 days, and older ones a session still links to. They show in Done (or by their session state) while the filter is on, and every key works on them, so `n` starts a follow-up session. `enter` moves to the first match and keeps the filter on; `esc` in the box clears it. The status line shows how many issues match |
-| `enter` | On a card: focus its sessions. On a session: attach in a new iTerm2 tab. On a deleted session (under the `Deleted` divider in the sessions panel): resume it as a background session under the same id, put it back on its issue, and attach |
-| `n` | New background session on the selected issue (asks for an optional prompt). On a Todo or Backlog issue the box also offers to move it to In Progress on the project its status comes from: ticked by default for Todo, unticked for Backlog. A checkbox at the bottom, unticked by default, attaches to the new session in a new iTerm2 tab. With no issue card selected (an unlinked session, or nothing) it does what `N` does |
+| `enter` | On a card: focus its sessions. On a session: attach in a new terminal tab. On a deleted session (under the `Deleted` divider in the sessions panel): resume it as a background session under the same id, put it back on its issue, and attach |
+| `n` | New background session on the selected issue (asks for an optional prompt). On a Todo or Backlog issue the box also offers to move it to In Progress on the project its status comes from: ticked by default for Todo, unticked for Backlog. A checkbox at the bottom, unticked by default, attaches to the new session in a new terminal tab. With no issue card selected (an unlinked session, or nothing) it does what `N` does |
 | `N` | New background session on no issue: asks for a prompt (required), lets Claude Code name the session, and it shows under Unlinked. The same attach checkbox as `n` |
 | `i` | New issue: pick one of the `issue_repos` from the config file (the first is the default), a title and an optional body; `enter` in the title or `ctrl+s` creates it. Then asks for an optional prompt to start a session on it and attach (`esc` skips) |
 | `l` / `u` | Link the selected session to an issue / remove its manual links |
@@ -105,7 +109,7 @@ A new issue is assigned to you unless you untick it in the dialog, and goes stra
 
 New sessions start in `session_dir` from the config file, or in the directory `tavla` was started in.
 
-Attaching opens a new tab in the current iTerm2 window, moves to the session's own directory (or `session_dir` when it has none recorded) and runs `claude attach <id>` there, so waking a finished session doesn't start it in your home directory. The tab is named after the session with an OSC 1 escape from its own shell (iTerm2 does not show a name set through AppleScript), and `CLAUDE_CODE_DISABLE_TERMINAL_TITLE=1` stops Claude Code from overwriting that name with its own title. Detaching leaves the tab's shell open; deleting the session (`ctrl+x` `d`, `tavla rm`, `claude rm`) closes the tab, provided the iTerm2 profile closes a session when its shell exits. The first attach asks macOS for permission to control iTerm2.
+Attaching opens a new tab in the current iTerm2 or Ghostty window (the `terminal` key in the config file; by default the one `tavla` runs in), moves to the session's own directory (or `session_dir` when it has none recorded) and runs `claude attach <id>` there, so waking a finished session doesn't start it in your home directory. The tab is named after the session with an OSC 1 escape from its own shell (iTerm2 does not show a name set through AppleScript), and `CLAUDE_CODE_DISABLE_TERMINAL_TITLE=1` stops Claude Code from overwriting that name with its own title. Detaching leaves the tab's shell open; deleting the session (`ctrl+x` `d`, `tavla rm`, `claude rm`) closes the tab, provided the iTerm2 profile closes a session when its shell exits. The first attach asks macOS for permission to control iTerm2.
 
 ## Core CLI
 

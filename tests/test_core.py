@@ -135,6 +135,7 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setattr(core, "ISSUE_REPOS", [("me/todo", "Personal"), ("team/tracker", "Team")])
     monkeypatch.setattr(core, "SESSION_CWD", tmp_path)
     monkeypatch.setattr(core, "THEME", "tavla")
+    monkeypatch.setattr(core, "TERMINAL", "iterm2")
     monkeypatch.setattr(core, "run", fake_run)
     monkeypatch.setattr(core, "graphql", fake_graphql)
     GRAPHQL_CALLS.clear()
@@ -300,6 +301,33 @@ def test_interactive_sessions_are_listed_and_linkable_but_not_attached(capsys):
     assert [(s["id"], s["state"], s["isInteractive"]) for s in card["sessions"]] == [("eeee5555", "idle", True)]
     assert core.main(["attach", "eeee5555", "--dry-run"]) == 1
     assert "interactive session" in capsys.readouterr().err
+
+
+def test_attach_opens_a_named_ghostty_tab_when_the_terminal_is_ghostty(monkeypatch):
+    calls = []
+    monkeypatch.setattr(core, "run", lambda argv, timeout=60, cwd=None: calls.append(argv) or "")
+    monkeypatch.setattr(core, "TERMINAL", "ghostty")
+    cmd = core.attach("aaaa1111", "fix flaky deploy", cwd="/Users/me/Code/my repo")
+    osa = calls[-1]
+    assert osa[0] == "osascript" and 'tell application "Ghostty"' in osa[2] and "iTerm2" not in osa[2]
+    # The same shell line as in iTerm2, plus the tab name for the name override.
+    assert osa[3:] == [cmd, "fix flaky deploy"] and "cd '/Users/me/Code/my repo' && " in cmd
+    core.attach("bbbb2222")
+    assert calls[-1][4] == "bbbb2222"
+
+
+def test_config_picks_the_terminal_and_rejects_an_unknown_one(monkeypatch):
+    core.CONFIG.mkdir(parents=True, exist_ok=True)
+    (core.CONFIG / "config.toml").write_text('terminal = "Ghostty"\n')
+    core.load_config()
+    assert core.TERMINAL == "ghostty"
+    # Without the key the detected terminal stays.
+    (core.CONFIG / "config.toml").write_text("")
+    core.load_config()
+    assert core.TERMINAL == "ghostty"
+    (core.CONFIG / "config.toml").write_text('terminal = "xterm"\n')
+    with pytest.raises(ValueError, match="terminal must be one of iterm2, ghostty"):
+        core.load_config()
 
 
 def test_attach_opens_an_iterm_tab_in_the_session_directory(monkeypatch):
@@ -1241,6 +1269,11 @@ def test_tui_names_the_terminal_tab_while_running_and_restores_it(monkeypatch):
     tui.run(out)
     assert seen == ["\x1b[22;1t\x1b]1;Tavla\x07"]
     assert out.getvalue().endswith("\x1b[23;1t")
+    # Ghostty names a tab after the window title.
+    monkeypatch.setattr(core, "TERMINAL", "ghostty")
+    out = io.StringIO()
+    tui.run(out)
+    assert seen[-1] == "\x1b[22;2t\x1b]2;Tavla\x07" and out.getvalue().endswith("\x1b[23;2t")
 
 
 def test_tui_deleting_the_selected_session_drops_it_from_the_detail_panel(monkeypatch):
