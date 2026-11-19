@@ -34,7 +34,9 @@ Tavla works without configuration: the board then shows the open issues assigned
 # Where new sessions start. Default: the directory tavla was started in.
 session_dir = "~/Code/my-notes"
 
-# "tavla" (the default) or any built-in Textual theme, e.g. "nord" or "textual-light".
+# "tavla" (the default) or any built-in Textual theme, e.g. "nord" or "textual-light". For a light terminal pick
+# "solarized-light": under any light theme the parent colours, merged PRs and the selected card adapt to the light background.
+# A theme picked with ctrl+p recolours the board at once but is not saved: the next start uses this one.
 theme = "tavla"
 
 # Where attaching opens its tab: "iterm2" or "ghostty". Default: "ghostty" when tavla

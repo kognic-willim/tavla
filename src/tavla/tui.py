@@ -28,10 +28,19 @@ REFRESH_S = 60
 COL_MIN = 36  # five board columns at this width fit a 190-wide terminal
 GLYPH = {"needs": "●", "working": "◐", "idle": "○"}
 SESSION_COLOR = {"needs": "$warning", "working": "$accent", "idle": "$text-muted"}
-MERGED = "#a371f7"
-# One per parent issue on the board; past eight parents, colours are shared.
-PARENT_COLORS = ["#6cb6ff", "#f69d50", "#dcbdfb", "#57c4b8", "#f47067", "#c6d05a", "#e275ad", "#96a8f8"]
 GROUPINGS = {"status": "issue status", "session": "session state", "parent": "parent issue"}
+# tavla's own colours, one set for dark themes and one for light: "merged" is a merged PR and a closed issue's check mark,
+# "parents" one per parent issue on the board (past eight parents, colours are shared). Slot n means the same parent in both.
+PARENT_SLOTS = 8
+DARK = {"merged": "#a371f7", "parents": ["#6cb6ff", "#f69d50", "#dcbdfb", "#57c4b8", "#f47067", "#c6d05a", "#e275ad", "#96a8f8"]}
+LIGHT = {"merged": "#6c71c4", "parents": ["#268bd2", "#cb4b16", "#6c71c4", "#2aa198", "#dc322f", "#b58900", "#d33682", "#859900"]}  # the Solarized accents
+palette = dict(DARK)  # the set for the current theme, swapped by BoardApp when the theme changes
+
+
+def use_palette(dark: bool) -> None:
+    palette.update(DARK if dark else LIGHT)
+
+
 TAVLA = Theme(
     name="tavla",
     primary="#71bc6d",
@@ -76,7 +85,7 @@ def session_chip(card: dict) -> str:
 
 
 def pr_color(state: str) -> str:
-    return "$success" if state == "OPEN" else MERGED if state == "MERGED" else "$text-muted"
+    return "$success" if state == "OPEN" else palette["merged"] if state == "MERGED" else "$text-muted"
 
 
 def pr_chip(prs: list[dict]) -> str:
@@ -133,13 +142,13 @@ def assign_parent_colors(cards: list[dict]) -> None:
     parent_slots.clear()
     parent_keys[:] = sorted({c["parent"]["key"] for c in cards if c.get("parent")})
     for key in parent_keys:
-        slot = zlib.crc32(key.encode()) % len(PARENT_COLORS)
-        free = [(slot + i) % len(PARENT_COLORS) for i in range(len(PARENT_COLORS)) if (slot + i) % len(PARENT_COLORS) not in parent_slots.values()]
+        slot = zlib.crc32(key.encode()) % PARENT_SLOTS
+        free = [(slot + i) % PARENT_SLOTS for i in range(PARENT_SLOTS) if (slot + i) % PARENT_SLOTS not in parent_slots.values()]
         parent_slots[key] = free[0] if free else slot
 
 
 def parent_color(key: str) -> str:
-    return PARENT_COLORS[parent_slots.get(key, zlib.crc32(key.encode()) % len(PARENT_COLORS))]
+    return palette["parents"][parent_slots.get(key, zlib.crc32(key.encode()) % PARENT_SLOTS)]
 
 
 def parent_number(key: str) -> int | None:
@@ -174,7 +183,7 @@ def labels_line(card: dict) -> str:
 
 def ref_parts(card: dict) -> tuple[str, str]:
     repo, num = card["key"].split("/", 1)[1].split("#")
-    icon = "[$success]◉[/]" if card["isOpen"] else f"[{MERGED}]✓[/]"
+    icon = "[$success]◉[/]" if card["isOpen"] else f"[{palette['merged']}]✓[/]"
     return icon, f"{repo} #{num}"
 
 
@@ -663,6 +672,9 @@ class BoardApp(App):
     ListView.cards > ListItem.card.has-session {{ background: $primary 18%; border: round $primary 60%; }}
     ListView.cards > ListItem.card.has-session.-highlight {{ background: $primary 28%; }}
     ListView.cards:focus > ListItem.card.has-session.-highlight {{ background: $primary 28%; border: round $accent; }}
+    /* A light theme darkens the selection instead; the has-session and focused-row rules are repeated to outrank it. */
+    App.-light-mode ListView.cards > ListItem.card.-highlight {{ background: $surface-darken-1; }}
+    App.-light-mode ListView.cards > ListItem.card.has-session.-highlight {{ background: $primary 28%; }}
     .card-title {{ width: 1fr; text-style: bold; margin-bottom: 1; }}
     .card-ref {{ height: 1; }}
     .card-icon {{ width: auto; margin-right: 1; }}
@@ -687,6 +699,8 @@ class BoardApp(App):
     ListView.cards > ListItem.row {{ height: 1; padding: 0 1; background: transparent; }}
     ListView.cards > ListItem.row.-highlight {{ background: $surface-lighten-1; }}
     ListView.cards:focus > ListItem.row.-highlight {{ background: $accent 30%; }}
+    App.-light-mode ListView.cards > ListItem.row.-highlight {{ background: $surface-darken-1; }}
+    App.-light-mode ListView.cards:focus > ListItem.row.-highlight {{ background: $accent 30%; }}
     ListView.cards > ListItem.group-row {{ height: 1; margin-top: 1; padding: 0 1; background: transparent; }}
     ListView.cards > ListItem.group-row:first-child {{ margin-top: 0; }}
     ListItem.group-row .col-header {{ margin: 0; padding: 0; }}
@@ -794,6 +808,8 @@ class BoardApp(App):
     async def on_mount(self) -> None:
         self.register_theme(TAVLA)
         self.theme = core.THEME if core.THEME in self.available_themes else "tavla"
+        use_palette(self.current_theme.dark)
+        self.theme_changed_signal.subscribe(self, self.theme_changed)
         await self.build_columns()
         self.action_refresh()
         self.set_interval(REFRESH_S, self.action_refresh)
@@ -835,6 +851,12 @@ class BoardApp(App):
             self.parent_filter = None
         await self.fill_columns()
         self.update_status()
+
+    def theme_changed(self, theme: Theme) -> None:
+        """Recolour the board from the data already loaded: a theme picked with ctrl+p asks GitHub and claude nothing."""
+        use_palette(theme.dark)
+        self.update_status()
+        self.call_later(self.fill_columns)
 
     async def apply(self, data: dict) -> None:
         self.loading = False
@@ -900,7 +922,7 @@ class BoardApp(App):
 
     async def replace_items(self, lv: ListView, rows: list[dict], make, keep: str | None) -> None:
         """Redraw a list only when its rows changed, keeping the highlighted row by key and the focus where it was."""
-        signature = json.dumps(rows, sort_keys=True, default=str) + self.grouping + json.dumps(parent_slots, sort_keys=True)
+        signature = json.dumps(rows, sort_keys=True, default=str) + self.grouping + json.dumps(parent_slots, sort_keys=True) + json.dumps(palette)
         if self.signatures.get(lv.id or "") == signature:
             return
         self.signatures[lv.id or ""] = signature
