@@ -1,7 +1,7 @@
 import asyncio
 import json
 import re
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 
 import pytest
 
@@ -17,9 +17,10 @@ JOBS = {
 }
 
 
-def item(repo, number, title, status):
+def item(repo, number, title, status, sprint=None):
     content = {"__typename": "Issue", "number": number, "title": title, "url": f"https://github.com/{repo}/issues/{number}", "repository": {"nameWithOwner": repo}}
-    return {"id": f"PVTI_{number}", "status": {"name": status}, "content": content}
+    value = {"iterationId": sprint["id"], "title": sprint["title"], "startDate": sprint["startDate"], "duration": sprint["duration"]} if sprint else None
+    return {"id": f"PVTI_{number}", "status": {"name": status}, "sprint": value, "content": content}
 
 
 PROJECTS = {
@@ -39,6 +40,9 @@ CLOSED_PROJECTS = {"me": [closed_item("me/todo", 5, "Shipped report", 5), closed
 CLOSED = {"acme/infra#20", "acme/infra#31", "me/todo#5", "me/todo#4"}
 GRAPHQL_CALLS: list[str] = []
 STATUS_SETS: list[dict] = []
+SPRINT_WRITES: list[tuple[str, dict]] = []
+# The iteration field of each project, as GitHub's field(name:) answers it: None when the project has no field by that name.
+SPRINT_FIELDS: dict[str, dict | None] = {}
 RESUMED: list[dict] = []
 
 
@@ -89,6 +93,12 @@ PARENTS = {"acme/infra#7": parent_node("acme/platform", 2, "Reliable rollouts", 
 def fake_graphql(query, variables=None):
     if query.strip().startswith("{ rateLimit"):
         return {"data": {"rateLimit": {"remaining": 10, "resetAt": "2030-01-01T00:00:00Z"}}}
+    if "addProjectV2ItemById" in query:
+        SPRINT_WRITES.append(("add", variables))
+        return {"data": {"addProjectV2ItemById": {"item": {"id": "PVTI_new"}}}}
+    if "iterationId: $iteration" in query:
+        SPRINT_WRITES.append(("iteration", variables))
+        return {"data": {"updateProjectV2ItemFieldValue": {"projectV2Item": {"id": variables["item"]}}}}
     if "updateProjectV2ItemFieldValue" in query:
         STATUS_SETS.append(variables)
         return {"data": {"updateProjectV2ItemFieldValue": {"projectV2Item": {"id": variables["item"]}}}}
@@ -100,10 +110,20 @@ def fake_graphql(query, variables=None):
         assert variables["filter"].startswith("is:closed is:issue updated:>=")
         page = {"pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": CLOSED_PROJECTS[variables["owner"]]}
         return {"data": {"repositoryOwner": {"projectV2": {"items": page}}}}
+    if "projectV2" in query and "items(" not in query:  # the sprint writes read the field, and a new issue's id
+        GRAPHQL_CALLS.append(f"sprint field {variables['owner']}")
+        data = {"repositoryOwner": {"projectV2": {"id": f"PVT_{variables['owner']}", "sprintField": SPRINT_FIELDS.get(variables["owner"])}}}
+        if "issue" in variables:
+            data["repository"] = {"issue": {"id": f"I_{variables['issue']}"}}
+        return {"data": data}
     if "projectV2" in query:
         GRAPHQL_CALLS.append(f"project {variables['owner']}")
-        page = {"pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": PROJECTS[variables["owner"]]}
-        return {"data": {"repositoryOwner": {"projectV2": {"items": page}}}}
+        project = {"items": {"pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": PROJECTS[variables["owner"]]}}
+        if "sprint" in variables:
+            project["sprintField"] = SPRINT_FIELDS.get(variables["owner"])
+        else:
+            assert "$sprint" not in query  # a project with no sprint key asks for nothing more than before
+        return {"data": {"repositoryOwner": {"projectV2": project}}}
     GRAPHQL_CALLS.append("refs")
     data = {}
     for alias, owner, repo, num in re.findall(r'(r\d+): repository\(owner: "([^"]+)", name: "([^"]+)"\) \{ issueOrPullRequest\(number: (\d+)', query):
@@ -156,6 +176,8 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setattr(core, "graphql", fake_graphql)
     GRAPHQL_CALLS.clear()
     STATUS_SETS.clear()
+    SPRINT_WRITES.clear()
+    SPRINT_FIELDS.clear()
     RESUMED.clear()
 
 
@@ -1841,3 +1863,143 @@ def test_metadata_cached_without_a_parent_is_fetched_again_at_once():
     GRAPHQL_CALLS.clear()
     core.build_board()
     assert "refs" not in GRAPHQL_CALLS  # and then it is cached like the rest
+
+
+# --- sprints ---------------------------------------------------------------------
+
+S14 = {"id": "it14", "title": "Sprint 14", "startDate": "2026-02-23", "duration": 14}
+S15 = {"id": "it15", "title": "Sprint 15", "startDate": "2026-03-09", "duration": 14}
+S16 = {"id": "it16", "title": "Sprint 16", "startDate": "2026-03-23", "duration": 14}
+SPRINT_FIELD = {"id": "PVTIF_sprint", "configuration": {"iterations": [S15, S16], "completedIterations": [S14]}}
+# The team project is a backlog project too, so every open item of it has a card unless the sprint filter takes it off.
+SPRINT_ITEMS = [
+    item("acme/infra", 7, "Deploy is flaky", "Blocked", S15),  # in the current sprint, with a session that needs me
+    item("acme/infra", 9, "Assigned but untouched", "Todo"),  # no sprint: off the board; the parent of acme/infra#11
+    item("acme/infra", 13, "Slipped work", "In progress", S14),  # a leftover
+    item("acme/infra", 14, "Next up", "Todo", S16),  # planned
+    item("acme/charts", 3, "Upgrade chart", "In progress"),  # no sprint, but a working session keeps it
+    item("acme/infra", 31, "Closed since", "Todo"),  # closed after the list was cached: exempt
+]
+
+
+@pytest.fixture
+def sprints(monkeypatch):
+    """The team project names its iteration field; today is the second day of Sprint 15."""
+    monkeypatch.setattr(
+        core,
+        "PROJECTS",
+        [{"owner": "me", "number": "1", "is_backlog": True}, {"owner": "team", "number": "23", "is_backlog": True, "sprint": "Sprint"}, {"owner": "extra", "number": "2", "is_backlog": False}],
+    )
+    monkeypatch.setitem(PROJECTS, "team", SPRINT_ITEMS)
+    monkeypatch.setitem(CLOSED_PROJECTS, "team", [])
+    SPRINT_FIELDS["team"] = SPRINT_FIELD
+    monkeypatch.setattr(core, "today", lambda: date(2026, 3, 10))
+
+
+def sprint_of(board):
+    return {c["key"]: (c["sprint"], c["searchOnly"]) for c in board["cards"]}
+
+
+def test_only_issues_in_the_sprint_stay_on_the_board(sprints):
+    board = core.build_board()
+    cards = sprint_of(board)
+    assert cards["acme/infra#7"] == ({"title": "Sprint 15", "state": "current"}, False)
+    assert cards["acme/infra#13"] == ({"title": "Sprint 14", "state": "leftover"}, False)
+    assert cards["acme/infra#14"] == ({"title": "Sprint 16", "state": "planned"}, True)
+    assert cards["acme/infra#9"] == ({"title": "", "state": "none"}, True)
+    assert cards["acme/charts#3"] == ({"title": "", "state": "none"}, False)  # a session keeps it
+    assert cards["acme/infra#11"] == (None, False)  # on no sprint project
+    assert cards["acme/infra#31"][0] is None  # closed: exempt
+    assert board["sprints"] == [{"project": "team/23", "title": "Sprint 15", "daysLeft": 13}]
+    text = core.summary(board, "status")
+    assert "Next up" not in text and "Assigned but untouched" not in text and "Slipped work" in text
+
+
+def test_between_two_sprints_the_last_started_one_is_current(sprints, monkeypatch):
+    monkeypatch.setattr(core, "today", lambda: date(2026, 3, 22))  # the last day of Sprint 15
+    assert core.build_board()["sprints"] == [{"project": "team/23", "title": "Sprint 15", "daysLeft": 1}]
+    short = {**S15, "duration": 7}  # ended on the 15th; Sprint 16 starts on the 23rd
+    SPRINT_FIELDS["team"] = {"id": "PVTIF_sprint", "configuration": {"iterations": [S16], "completedIterations": [short, S14]}}
+    monkeypatch.setitem(PROJECTS, "team", [item("acme/infra", 7, "Deploy is flaky", "Blocked", short), *SPRINT_ITEMS[1:]])
+    board = core.build_board(force=True)
+    assert board["sprints"] == [{"project": "team/23", "title": "Sprint 15", "daysLeft": -6}]
+    assert sprint_of(board)["acme/infra#7"] == ({"title": "Sprint 15", "state": "current"}, False)  # not a leftover in the gap
+    monkeypatch.setattr(core, "today", lambda: date(2026, 2, 1))  # before any sprint started
+    board = core.build_board()
+    assert board["sprints"] == [] and sprint_of(board)["acme/infra#13"] == ({"title": "Sprint 14", "state": "planned"}, True)
+
+
+def test_an_issue_in_the_sprint_on_one_sprint_project_is_in_the_sprint(sprints, monkeypatch):
+    monkeypatch.setitem(core.PROJECTS[0], "sprint", "Sprint")  # the backlog project is a sprint project too
+    SPRINT_FIELDS["me"] = SPRINT_FIELD
+    monkeypatch.setitem(PROJECTS, "me", [item("acme/infra", 9, "Assigned but untouched", "Todo", S15), item("acme/infra", 11, "Personal todo", "Todo", S16)])
+    cards = sprint_of(core.build_board())
+    assert cards["acme/infra#9"] == ({"title": "Sprint 15", "state": "current"}, False)  # no sprint on the team project
+    assert cards["acme/infra#11"] == ({"title": "Sprint 16", "state": "planned"}, True)
+
+
+def test_a_session_keeps_a_card_outside_the_sprint_on_the_board(sprints):
+    core.link("cccc3333", "acme/infra#9")
+    cards = {c["key"]: c for c in core.build_board()["cards"]}
+    assert (cards["acme/infra#9"]["searchOnly"], cards["acme/infra#9"]["sprint"]["state"]) == (False, "none")
+    assert cards["acme/infra#9"]["sprintItem"] == {"project": "team/23", "itemId": "PVTI_9"}
+
+
+def test_a_misnamed_sprint_field_is_reported_and_its_project_shows_as_before(sprints, monkeypatch):
+    SPRINT_FIELDS["team"] = None  # GitHub answers null for a field it doesn't have
+    monkeypatch.setitem(core.PROJECTS[1], "sprint", "Sprnt")
+    board = core.build_board()
+    assert 'project team/23: no iteration field "Sprnt"' in board["errors"]
+    assert board["sprints"] == [] and not any(c["sprint"] or c["sprintFiltered"] for c in board["cards"])
+    assert not any(c["searchOnly"] for c in board["cards"] if c["isOpen"])
+    GRAPHQL_CALLS.clear()
+    again = core.build_board()  # from the cache, which remembers the field is missing
+    assert GRAPHQL_CALLS == [] and 'project team/23: no iteration field "Sprnt"' in again["errors"]
+
+
+def test_sprint_data_is_cached_and_used_offline_whatever_its_age(sprints, monkeypatch):
+    core.build_board()
+    cache = json.loads((core.CONFIG / "projects-cache.json").read_text())
+    (core.CONFIG / "projects-cache.json").write_text(json.dumps({**cache, "at": 0}))
+    GRAPHQL_CALLS.clear()
+    board = core.cached_board()
+    assert GRAPHQL_CALLS == [] and board["sprints"][0]["title"] == "Sprint 15"
+    assert sprint_of(board)["acme/infra#9"] == ({"title": "", "state": "none"}, True)
+
+    monkeypatch.setattr(core, "graphql", lambda query, variables=None: {})  # GitHub can't be read
+    board = core.build_board(force=True)
+    assert sprint_of(board)["acme/infra#14"] == ({"title": "Sprint 16", "state": "planned"}, True)  # the cached field stands
+
+
+def test_unreadable_sprint_data_with_nothing_cached_fails_open(sprints, monkeypatch):
+    monkeypatch.setattr(core, "graphql", lambda query, variables=None: {} if "projectV2" in query and variables["owner"] == "team" else fake_graphql(query, variables))
+    board = core.build_board()
+    assert any("team/23: not readable" in e for e in board["errors"]) and board["sprints"] == []
+    assert not any(c["sprintFiltered"] for c in board["cards"])
+
+
+def test_a_cache_from_before_the_sprint_key_is_fetched_again_at_once(sprints, monkeypatch):
+    sprint_project = core.PROJECTS[1]
+    monkeypatch.setattr(core, "PROJECTS", [{k: v for k, v in p.items() if k != "sprint"} for p in core.PROJECTS])
+    core.build_board()  # caches the lists without sprints
+    monkeypatch.setattr(core, "PROJECTS", [core.PROJECTS[0], sprint_project, core.PROJECTS[2]])
+    GRAPHQL_CALLS.clear()
+    board = core.build_board()
+    assert "project team" in GRAPHQL_CALLS and board["sprints"][0]["title"] == "Sprint 15"
+
+
+def test_config_names_a_projects_sprint_field():
+    core.CONFIG.mkdir(parents=True)
+    (core.CONFIG / "config.toml").write_text('[[projects]]\nowner = "octo-org"\nnumber = 9\nsprint = "Iteration"\n\n[[projects]]\nowner = "octo"\nnumber = 4\n')
+    core.load_config()
+    assert core.PROJECTS == [{"owner": "octo-org", "number": "9", "is_backlog": False, "sprint": "Iteration"}, {"owner": "octo", "number": "4", "is_backlog": False}]
+
+
+def test_dump_leaves_issues_outside_the_sprint_out_and_json_marks_them_search_only(sprints, capsys):
+    assert core.main(["json"]) == 0
+    cards = {c["key"]: c for c in json.loads(capsys.readouterr().out)["cards"]}
+    assert cards["acme/infra#14"]["searchOnly"] and cards["acme/infra#14"]["sprint"] == {"title": "Sprint 16", "state": "planned"}
+    assert all("sprint" in c for c in cards.values()) and cards["acme/infra#11"]["sprint"] is None
+    assert core.main(["dump"]) == 0
+    out = capsys.readouterr().out
+    assert "Next up" not in out and "Assigned but untouched" not in out and "Deploy is flaky" in out

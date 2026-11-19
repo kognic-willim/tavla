@@ -16,6 +16,7 @@ import time
 import tomllib
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import suppress
+from datetime import date, timedelta
 from pathlib import Path
 
 JOBS = Path.home() / ".claude" / "jobs"
@@ -46,6 +47,40 @@ query($owner: String!, $number: Int!, $cursor: String) {
     items(first: 100, after: $cursor, query: "is:open is:issue") { pageInfo { hasNextPage endCursor }
       nodes { id status: fieldValueByName(name: "Status") { ... on ProjectV2ItemFieldSingleSelectValue { name } }
         content { __typename ... on Issue { number title url repository { nameWithOwner } } } } } } } }
+}
+"""
+ITERATION = "id title startDate duration"
+SPRINT_FIELD = f"sprintField: field(name: $sprint) {{ ... on ProjectV2IterationField {{ id configuration {{ iterations {{ {ITERATION} }} completedIterations {{ {ITERATION} }} }} }} }}"
+# A sprint project's items also carry their sprint, and each page the iteration field's sprints.
+SPRINT_PROJECT_QUERY = f"""
+query($owner: String!, $number: Int!, $cursor: String, $sprint: String!) {{
+  repositoryOwner(login: $owner) {{ ... on ProjectV2Owner {{ projectV2(number: $number) {{ {SPRINT_FIELD}
+    items(first: 100, after: $cursor, query: "is:open is:issue") {{ pageInfo {{ hasNextPage endCursor }}
+      nodes {{ id status: fieldValueByName(name: "Status") {{ ... on ProjectV2ItemFieldSingleSelectValue {{ name }} }}
+        sprint: fieldValueByName(name: $sprint) {{ ... on ProjectV2ItemFieldIterationValue {{ iterationId title startDate duration }} }}
+        content {{ __typename ... on Issue {{ number title url repository {{ nameWithOwner }} }} }} }} }} }} }} }}
+}}
+"""
+# What the sprint writes need: the project and field ids, its sprints, and with $issue the issue's id.
+SPRINT_TARGET_QUERY = f"""
+query($owner: String!, $number: Int!, $sprint: String!) {{
+  repositoryOwner(login: $owner) {{ ... on ProjectV2Owner {{ projectV2(number: $number) {{ id {SPRINT_FIELD} }} }} }}
+}}
+"""
+SPRINT_ISSUE_TARGET_QUERY = f"""
+query($owner: String!, $number: Int!, $sprint: String!, $repoOwner: String!, $repo: String!, $issue: Int!) {{
+  repositoryOwner(login: $owner) {{ ... on ProjectV2Owner {{ projectV2(number: $number) {{ id {SPRINT_FIELD} }} }} }}
+  repository(owner: $repoOwner, name: $repo) {{ issue(number: $issue) {{ id }} }}
+}}
+"""
+ADD_ITEM_MUTATION = """
+mutation($project: ID!, $content: ID!) {
+  addProjectV2ItemById(input: {projectId: $project, contentId: $content}) { item { id } }
+}
+"""
+SET_ITERATION_MUTATION = """
+mutation($project: ID!, $item: ID!, $field: ID!, $iteration: String!) {
+  updateProjectV2ItemFieldValue(input: {projectId: $project, itemId: $item, fieldId: $field, value: {iterationId: $iteration}}) { projectV2Item { id } }
 }
 """
 CLOSED_PROJECT_QUERY = """
@@ -96,7 +131,10 @@ def load_config() -> None:
     except tomllib.TOMLDecodeError as err:
         raise ValueError(f"{path}: {err}") from err
     try:
-        projects = [{"owner": str(p["owner"]), "number": str(int(p["number"])), "is_backlog": bool(p.get("backlog", False))} for p in cfg.get("projects", [])]
+        projects = [
+            {"owner": str(p["owner"]), "number": str(int(p["number"])), "is_backlog": bool(p.get("backlog", False)), **({"sprint": str(p["sprint"])} if p.get("sprint") else {})}
+            for p in cfg.get("projects", [])
+        ]
         repos = [(str(r["repo"]), str(r.get("label") or r["repo"])) for r in cfg.get("issue_repos", [])]
     except (KeyError, TypeError, ValueError) as err:
         raise ValueError(f"{path}: a [[projects]] entry needs owner and number, an [[issue_repos]] entry needs repo ({err!r})") from err
@@ -166,6 +204,11 @@ def start_backoff() -> float:
 
 def now_ms() -> int:
     return int(time.time() * 1000)
+
+
+def today() -> date:
+    """The local date sprints are measured against; tests fix it."""
+    return date.today()
 
 
 def key_of(r: Ref) -> str:
@@ -442,10 +485,19 @@ def read_cache(name: str, ttl: float, force: bool, offline: bool) -> tuple[list 
     return items, offline or (not force and age < ttl)
 
 
-def write_cache(name: str, items: list, errors: list[str]) -> None:
+def read_cache_extra(name: str, key: str) -> dict:
+    """Another part of a cache file than its items, e.g. the projects' sprint fields; empty when there is none."""
+    try:
+        value = json.loads((CONFIG / name).read_text()).get(key)
+    except FileNotFoundError, json.JSONDecodeError, AttributeError:
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def write_cache(name: str, items: list, errors: list[str], **extra: dict) -> None:
     try:
         CONFIG.mkdir(parents=True, exist_ok=True)
-        (CONFIG / name).write_text(json.dumps({"at": time.time(), "items": items}))
+        (CONFIG / name).write_text(json.dumps({"at": time.time(), "items": items, **extra}))
     except OSError as err:  # a cache that can't be saved must not cost the fresh answer
         errors.append(f"{name}: {err}")
 
@@ -513,28 +565,50 @@ def load_closed(force: bool, errors: list[str], offline: bool = False) -> list[d
     return items
 
 
-def load_projects(force: bool, errors: list[str], offline: bool = False) -> list[dict]:
-    """Status is read from the project side: issue-side projectItems is empty for cross-org projects.
-    Offline, the cached lists are used whatever their age, and so is the cached list of a project GitHub won't answer for."""
-    cached, fresh = read_cache("projects-cache.json", PROJECT_TTL_S, force, offline)
-    if fresh or offline:
-        return cached or []
+def project_id(p: dict) -> str:
+    return f"{p['owner']}/{p['number']}"
 
-    def fetch(p: dict) -> list[dict] | None:
+
+def sprint_field_of(node: dict | None, name: str) -> dict:
+    """A project's iteration field as the sprint rule uses it: its name, whether it is one, and its sprints."""
+    config = (node or {}).get("configuration")
+    if not config:  # no field by that name (GitHub answers null), or one that isn't an iteration field
+        return {"name": name, "ok": False, "iterations": []}
+    sprints = [*(config.get("iterations") or []), *(config.get("completedIterations") or [])]
+    return {"name": name, "ok": True, "iterations": [{k: s.get(k) for k in ("id", "title", "startDate", "duration")} for s in sprints]}
+
+
+def load_projects(force: bool, errors: list[str], offline: bool = False) -> tuple[list[dict], dict[str, dict]]:
+    """The open issues of every project with their status, and each sprint project's iteration field by project.
+
+    Status is read from the project side: issue-side projectItems is empty for cross-org projects.
+    Offline, the cached lists are used whatever their age, and so is the cached list of a project GitHub won't answer for.
+    A cache from before a project's sprint key was set (or changed) is out of date at once."""
+    cached, fresh = read_cache("projects-cache.json", PROJECT_TTL_S, force, offline)
+    cached_fields = read_cache_extra("projects-cache.json", "fields")
+    fresh = fresh and all((cached_fields.get(project_id(p)) or {}).get("name") == p["sprint"] for p in PROJECTS if p.get("sprint"))
+    if fresh or offline:
+        return cached or [], cached_fields
+
+    def fetch(p: dict) -> tuple[list[dict], dict | None] | None:
         # Status and issue identity only: 1 point per 100 items, where `gh project item-list` reads every field.
         # Open issues only: a closed issue is Done whatever its status, and pages are fetched one after another.
-        items, cursor = [], None
+        items, cursor, field = [], None, None
+        query, sprint = (SPRINT_PROJECT_QUERY, {"sprint": p["sprint"]}) if p.get("sprint") else (PROJECT_QUERY, {})
         while True:
-            variables = {"owner": p["owner"], "number": int(p["number"]), **({"cursor": cursor} if cursor else {})}
+            variables = {"owner": p["owner"], "number": int(p["number"]), **sprint, **({"cursor": cursor} if cursor else {})}
             try:
-                page = ((((graphql(PROJECT_QUERY, variables).get("data") or {}).get("repositoryOwner") or {}).get("projectV2") or {}).get("items")) or None
+                project = (((graphql(query, variables).get("data") or {}).get("repositoryOwner") or {}).get("projectV2")) or {}
             except RateLimited:
                 raise
             except Exception:  # noqa: BLE001 - no network, a timeout, an answer that isn't JSON
-                page = None
+                project = {}
+            page = project.get("items") or None
             if page is None:
-                errors.append(f"project {p['owner']}/{p['number']}: not readable")
+                errors.append(f"project {project_id(p)}: not readable")
                 return None
+            if sprint and field is None:
+                field = sprint_field_of(project.get("sprintField"), p["sprint"])
             for it in page["nodes"]:
                 c = it.get("content") or {}
                 if c.get("__typename") != "Issue":
@@ -546,26 +620,63 @@ def load_projects(force: bool, errors: list[str], offline: bool = False) -> list
                         "url": c.get("url") or "",
                         "status": (it.get("status") or {}).get("name") or "",
                         "isBacklog": p["is_backlog"],
-                        "project": f"{p['owner']}/{p['number']}",
+                        "project": project_id(p),
                         "itemId": it.get("id") or "",
+                        "sprint": sprint_value(it.get("sprint")),
                     }
                 )
             if not page["pageInfo"]["hasNextPage"]:
-                return items
+                return items, field
             cursor = page["pageInfo"]["endCursor"]
 
     if not PROJECTS:
-        return []
+        return [], {}
     # Projects in parallel, pages within one in order: the wall time is the longest project's pages.
     with ThreadPoolExecutor(len(PROJECTS)) as pool:
-        lists = list(pool.map(fetch, PROJECTS))
-    if all(lst is not None for lst in lists):
-        items = [i for lst in lists for i in lst]
-        write_cache("projects-cache.json", items, errors)
-        return items
-    # A project that can't be read (no network, a GitHub error) keeps its last cached list, in the projects' order.
+        answers = list(pool.map(fetch, PROJECTS))
+    # A project that can't be read (no network, a GitHub error) keeps its last cached list and field, in the projects' order.
     last = cached or []
-    return [i for p, lst in zip(PROJECTS, lists) for i in (lst if lst is not None else [c for c in last if c.get("project") == f"{p['owner']}/{p['number']}"])]
+    items = [i for p, a in zip(PROJECTS, answers) for i in (a[0] if a is not None else [c for c in last if c.get("project") == project_id(p)])]
+    fields = {project_id(p): a[1] if a is not None else cached_fields.get(project_id(p)) for p, a in zip(PROJECTS, answers) if p.get("sprint")}
+    fields = {k: f for k, f in fields.items() if f}
+    if all(a is not None for a in answers):
+        write_cache("projects-cache.json", items, errors, fields=fields)
+    return items, fields
+
+
+def sprint_value(value: dict | None) -> dict | None:
+    """An item's sprint as the iteration value has it; None for no sprint (or a project with no sprint key)."""
+    if not value or not value.get("iterationId"):
+        return None
+    return {"id": value["iterationId"], "title": value.get("title") or "", "startDate": value.get("startDate") or "", "duration": value.get("duration") or 0}
+
+
+def current_sprint(field: dict, day: date) -> dict | None:
+    """The sprint that has started and not ended; between two sprints, the most recently started one."""
+    started = [s for s in field["iterations"] if s.get("startDate") and s["startDate"] <= day.isoformat()]
+    return max(started, key=lambda s: s["startDate"], default=None)
+
+
+SPRINT_RANK = {"current": 0, "leftover": 1, "planned": 2, "none": 3}
+
+
+def issue_sprint(items: list[dict], current: dict[str, dict | None], day: date) -> tuple[dict, dict]:
+    """An issue's sprint across the sprint projects it is on, and the project item it comes from.
+
+    In the sprint (current, or a leftover from an earlier started sprint) wins over outside it (planned, or none)."""
+    best: tuple[dict, dict] | None = None
+    for it in items:
+        s, cur = it.get("sprint"), current.get(it["project"])
+        if not s:
+            state = "none"
+        elif s["startDate"] > day.isoformat():
+            state = "planned"
+        else:
+            state = "current" if cur and s["id"] == cur["id"] else "leftover"
+        if best is None or SPRINT_RANK[state] < SPRINT_RANK[best[0]["state"]]:
+            best = ({"title": s["title"] if s else "", "state": state}, it)
+    assert best is not None
+    return best
 
 
 def resolve_refs(refs: list[Ref], errors: list[str], force: bool = False, offline: bool = False) -> dict[str, dict]:
@@ -706,8 +817,26 @@ def _build_board(force: bool, offline: bool) -> dict:
         f_closed = pool.submit(load_closed, force, errors, offline)
         raw = f_sessions.result()
         assigned = f_assigned.result()
-        project_items = f_projects.result()
+        project_items, fields = f_projects.result()
         closed = f_closed.result()
+
+    # Sprint projects: those whose iteration field could be read. A misnamed field, or one never read, leaves its
+    # project out of the sprint rule (fail open), so it can't hide the board.
+    day = today()
+    sprint_fields: dict[str, dict] = {}
+    for p in PROJECTS:
+        field = fields.get(project_id(p)) if p.get("sprint") else None
+        if field and field["name"] == p["sprint"]:
+            if field["ok"]:
+                sprint_fields[project_id(p)] = field
+            else:
+                errors.append(f'project {project_id(p)}: no iteration field "{p["sprint"]}"')
+    current = {pid: current_sprint(f, day) for pid, f in sprint_fields.items()}
+    sprints = [{"project": pid, "title": s["title"], "daysLeft": (date.fromisoformat(s["startDate"]) + timedelta(days=s["duration"] or 0) - day).days} for pid, s in current.items() if s]
+    on_sprint_projects: dict[str, list[dict]] = {}
+    for it in project_items:
+        if it["project"] in sprint_fields:
+            on_sprint_projects.setdefault(it["key"], []).append(it)
 
     issues: dict[str, dict] = {}
 
@@ -779,6 +908,10 @@ def _build_board(force: bool, offline: bool) -> dict:
             continue
         # A finished issue stays on the board only while a session on it is live or recent; after that a search still finds it.
         search_only = status_column == "done" and session_column in ("idle", "backlog") and last_touch < recent
+        # Closed issues are exempt: the project lists hold open issues only.
+        sprint, sprint_item = issue_sprint(on_sprint_projects[key], current, day) if iss["isOpen"] and key in on_sprint_projects else (None, None)
+        # Outside the sprint, an issue leaves the board unless a session is on it; a search still finds it.
+        sprint_filtered = bool(sprint) and sprint["state"] in ("planned", "none") and not ss and not search_only
         m = meta.get(key, {})
         prs = {p["key"]: p for p in [*m.get("prs", []), *(p for s in ss for p in s["prs"])]}
         cards.append(
@@ -791,7 +924,10 @@ def _build_board(force: bool, offline: bool) -> dict:
                 "statusColumn": status_column,
                 "statusItem": status_item.get(key),
                 "sessionColumn": session_column,
-                "searchOnly": search_only,
+                "searchOnly": search_only or sprint_filtered,
+                "sprint": sprint,
+                "sprintItem": {"project": sprint_item["project"], "itemId": sprint_item["itemId"]} if sprint_item else None,
+                "sprintFiltered": sprint_filtered,
                 "updatedAt": max(iss["updatedAt"], last_touch),
                 "sessions": ss,
                 "pastSessions": [s for s in past if key in s["issues"]],
@@ -811,7 +947,7 @@ def _build_board(force: bool, offline: bool) -> dict:
         (s for s in sessions if not on_card.intersection(s["issues"]) and (s["kind"] != "idle" or s["updatedAt"] >= recent)),
         key=lambda s: -s["updatedAt"],
     )
-    return {"cards": cards, "unlinked": unlinked, "fetchedAt": now_ms(), "errors": errors, "isOffline": False}
+    return {"cards": cards, "unlinked": unlinked, "sprints": sprints, "fetchedAt": now_ms(), "errors": errors, "isOffline": False}
 
 
 def columns(grouping: str) -> list[tuple[str, str]]:

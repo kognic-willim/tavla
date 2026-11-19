@@ -52,6 +52,7 @@ backlog = true
 [[projects]]
 owner = "octo-org"
 number = 12
+sprint = "Sprint"       # its iteration field: the board shows only the issues in the sprint
 
 # Repositories the new-issue dialog (`i`) and `tavla create` file issues in; the first is the default.
 [[issue_repos]]
@@ -64,6 +65,8 @@ label = "Team"
 ```
 
 A project's Status options are matched by name, ignoring case: Backlog, Todo or Ready, In Progress or In Review, Blocked, and Done. Any other status counts as Todo, and a closed issue as Done.
+
+A project with a `sprint` key is a *sprint project* (see `GLOSSARY.md` for the sprint terms). The board then shows only the issues *in the sprint*: their sprint, on any sprint project, has started, so the current sprint plus any *leftover* from an earlier sprint that is still open. The current sprint is the one that has started and not ended; between two sprints, the most recently started one. An issue *outside the sprint* (on a sprint project with no sprint, or *planned* for a sprint that hasn't started) leaves the board in every column and view unless a session is on it; `/` still finds it and `s` shows it. Issues on no sprint project and closed issues are not filtered. A field name that doesn't exist is reported in the status line (`no iteration field "Sprnt"`), and that project's issues show as if it had no `sprint` key. Without the key nothing changes.
 
 Set `TAVLA_HOME` to keep the config file and the local state in another directory.
 
@@ -152,6 +155,7 @@ Both need the `tavla` command on `PATH`.
 - **Cards:** open issues assigned to `@me` (`gh search issues`, cached for 5 minutes in `~/.config/tavla/assigned-cache.json`), non-Done items of the `backlog` projects in the config file, and any issue a session links to.
 - **Recently closed issues:** issues closed in the last 30 days that are assigned to `@me` (`gh search issues`) or sit in a `backlog` project, cached for 15 minutes in `closed-cache.json`. They are not on the board: only a search (`/`) shows them. `tavla json` lists them with `searchOnly: true`; `tavla dump` leaves them out.
 - **Issue status:** the Status field of the `projects` in the config file; the first match wins. Status is read from the project side, because issue-side `projectItems` is empty for cross-org projects. It is cached for 5 minutes in `~/.config/tavla/projects-cache.json`.
+- **Sprints:** a sprint project's list query also reads each item's sprint (the iteration field named by `sprint`: title, start date, length) and the field's sprints, in the same pages, so it costs no extra call. Both are cached with the statuses in `projects-cache.json` and, like them, used whatever their age when GitHub can't be reached; a cache written before the `sprint` key was set or changed is refreshed at once. A sprint project whose field can't be read and isn't cached is left out of the filter. `tavla json` lists the issues outside the sprint with `searchOnly: true`, and every card has a `sprint` field (`null` on no sprint project, else its title and `current`, `leftover`, `planned` or `none`); `tavla dump` leaves them out.
 - **GitHub budget:** everything except the session files spends the GraphQL rate limit (5,000 points an hour), `gh search` included. Project lists use a minimal query (1 point per 100 items, open issues only since a closed issue is Done whatever its status, the projects fetched in parallel), and issue/PR metadata is cached for 10 minutes in `meta-cache.json` (fetched 40 issues to a query, the queries in parallel), so a routine refresh only looks up what is new and otherwise calls nothing but `claude agents`. The recently closed issues cost one search and one project page every 15 minutes, plus their share of the metadata; `r` bypasses all four caches. When GitHub answers with a rate limit, all GitHub calls pause until the budget resets (read from GraphQL's own `rateLimit`; the REST `/rate_limit` graphql bucket can disagree), or 90 seconds for a burst limit, and the board is built from the session files and cached GitHub data alone (any age), with the pause time in its status line: sessions whose issue isn't cached show as Unlinked.
 - **Startup and no network:** the caches are kept between runs, so the board is drawn from them (any age) the moment `tavla` starts, with `refreshing…` in the status line until GitHub answers and replaces it. When GitHub can't be reached, each list keeps its last cached answer and the status line shows the error; every refresh (once a minute) asks again, so the board catches up by itself when the network is back.
 - **Sessions:** `~/.claude/jobs/*/state.json` for background sessions (`name`, `state`, `intent` = first prompt, `children` = linked PRs, `output.result`), plus `claude agents --json` for interactive ones. The job files are Claude Code internals and may change between versions.
