@@ -772,7 +772,9 @@ class BoardApp(App):
 
     def compose(self) -> ComposeResult:
         yield Static("loading…", id="status")
-        filter_box = FilterInput(placeholder="filter: every word must match a title, repo #N, status, label, parent issue or session name; recently closed issues match too", id="filter")
+        filter_box = FilterInput(
+            placeholder="filter: every word must match a title, repo #N, status, label, parent issue or session name; recently closed issues and issues outside the sprint match too", id="filter"
+        )
         filter_box.show(False)
         yield filter_box
         yield Columns(id="columns")
@@ -1226,9 +1228,10 @@ class BoardApp(App):
 
     async def refill_after_toggle(self) -> None:
         await self.fill_columns()
-        # A card that just went hidden (or out with s) left its list: follow the highlight to the row that took its place.
+        # A card that just went hidden (or out with s) left the board: follow the highlight to the row that took its place.
         lv = self.focused
-        if self.current and "sessions" in self.current and isinstance(lv, ListView) and lv.id != "sessions" and not any(self.item_key(it) == self.current_key() for it in lv.children):
+        on_board = any(self.item_key(it) == self.current_key() for col in self.query(".col ListView").results(ListView) for it in col.children)
+        if self.current and "sessions" in self.current and not on_board and isinstance(lv, ListView) and lv.id != "sessions":
             self.current, self.selection_list = self.payload(lv.highlighted_child), lv
             await self.show_detail()
         self.update_status()
