@@ -796,7 +796,7 @@ def test_tui_new_issue_defaults_to_personal_then_starts_and_attaches_a_session(m
             await app.workers.wait_for_complete()
             await pilot.press("i")
             await pilot.pause()
-            assert isinstance(app.screen, tui.NewIssue)
+            assert isinstance(app.screen, tui.NewIssue) and not app.screen.query("#issue-sprint")  # no sprint project
             await pilot.press("enter")  # no title yet: stays open
             await pilot.pause()
             assert isinstance(app.screen, tui.NewIssue) and created == []
@@ -2005,6 +2005,27 @@ def test_dump_leaves_issues_outside_the_sprint_out_and_json_marks_them_search_on
     assert "Next up" not in out and "Assigned but untouched" not in out and "Deploy is flaky" in out
 
 
+def test_a_new_issue_added_to_the_sprint_lands_in_the_first_sprint_projects_current_sprint(sprints):
+    core.build_board()
+    issue = core.create_issue("me/todo", "Write it down")
+    assert core.add_to_sprint(issue) == "Sprint 15"
+    assert SPRINT_WRITES == [("add", {"project": "PVT_team", "content": "I_77"}), ("iteration", {"project": "PVT_team", "item": "PVTI_new", "field": "PVTIF_sprint", "iteration": "it15"})]
+    GRAPHQL_CALLS.clear()
+    card = next(c for c in core.build_board()["cards"] if c["key"] == "me/todo#77")
+    assert card["sprint"] == {"title": "Sprint 15", "state": "current"} and not card["searchOnly"]
+    assert not any(c.startswith("project") for c in GRAPHQL_CALLS)  # from the patched cache
+
+
+def test_joining_the_sprint_moves_an_issue_outside_it_planned_or_not_into_the_current_sprint(sprints):
+    cards = {c["key"]: c for c in core.build_board()["cards"]}
+    assert core.join_current_sprint(cards["acme/infra#13"]) is False and SPRINT_WRITES == []  # a leftover is in the sprint
+    assert core.join_current_sprint(cards["acme/infra#14"]) is True  # planned for Sprint 16
+    assert core.join_current_sprint(cards["acme/infra#9"]) is True  # no sprint
+    assert SPRINT_WRITES == [("iteration", {"project": "PVT_team", "item": f"PVTI_{n}", "field": "PVTIF_sprint", "iteration": "it15"}) for n in (14, 9)]
+    cards = sprint_of(core.build_board())
+    assert cards["acme/infra#14"] == ({"title": "Sprint 15", "state": "current"}, False) and cards["acme/infra#9"][1] is False
+
+
 def test_tui_cards_outside_the_current_sprint_carry_a_sprint_chip_warning_where_something_is_off(sprints):
     from tavla import tui
 
@@ -2081,6 +2102,66 @@ def test_tui_parent_numbers_ignore_cards_outside_the_sprint(sprints):
             await pilot.pause()
             assert [c.card["key"] for c in app.query(tui.CardItem)] == ["acme/infra#11"]
             assert "1 of 7 issues" in str(app.query_one("#status").content)  # 9 cards, less the two outside the sprint
+
+    asyncio.run(scenario())
+
+
+def test_tui_new_issue_is_added_to_the_current_sprint_unless_unticked(sprints, monkeypatch):
+    from tavla import tui
+
+    monkeypatch.setattr(core, "attach", lambda sid, title="", dry_run=False, cwd="": "")
+
+    async def scenario():
+        app = tui.BoardApp()
+        async with app.run_test(size=(190, 50)) as pilot:
+            await app.workers.wait_for_complete()
+            await pilot.press("i")
+            await pilot.pause()
+            box = app.screen.query_one("#issue-sprint", tui.Checkbox)
+            assert box.value is True and str(box.label) == "Add to Sprint 15"
+            await pilot.press(*"Planned work", "enter")
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            assert [kind for kind, _ in SPRINT_WRITES] == ["add", "iteration"] and SPRINT_WRITES[1][1]["iteration"] == "it15"
+            await pilot.press("escape")  # no session
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            assert "card:me/todo#77" in [app.item_key(it) for it in app.query(tui.CardItem)]  # in the sprint: on the board
+
+            SPRINT_WRITES.clear()
+            await pilot.press("i")
+            await pilot.pause()
+            app.screen.query_one("#issue-sprint", tui.Checkbox).value = False
+            await pilot.press(*"Backlog idea", "enter")
+            await app.workers.wait_for_complete()
+            assert SPRINT_WRITES == []
+
+    asyncio.run(scenario())
+
+
+def test_tui_starting_work_on_an_issue_outside_the_sprint_moves_it_into_the_sprint(sprints, monkeypatch):
+    from tavla import tui
+
+    monkeypatch.setattr(core, "new_session", lambda target, prompt="", title="": "dddd4444")
+
+    async def scenario():
+        app = tui.BoardApp()
+        async with app.run_test(size=(190, 45)) as pilot:
+            await app.workers.wait_for_complete()
+            await pilot.press("s")  # shows acme/infra#9, Todo with no sprint
+            await pilot.pause()
+            todo = app.query_one("#col-todo")
+            todo.focus()
+            todo.index = next(i for i, it in enumerate(todo.children) if app.item_key(it) == "card:acme/infra#9")
+            await pilot.pause()
+            await pilot.press("n")
+            await pilot.pause()
+            box = app.screen.query_one("#to-progress", tui.Checkbox)
+            assert box.value is True and str(box.label) == "Move the issue from Todo to In Progress and into Sprint 15"
+            await pilot.press("enter")
+            await app.workers.wait_for_complete()
+            assert [v["item"] for v in STATUS_SETS] == ["PVTI_9"]
+            assert SPRINT_WRITES == [("iteration", {"project": "PVT_team", "item": "PVTI_9", "field": "PVTIF_sprint", "iteration": "it15"})]
 
     asyncio.run(scenario())
 

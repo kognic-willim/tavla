@@ -1163,15 +1163,76 @@ def start_progress(card: dict) -> bool:
     body = graphql(SET_STATUS_MUTATION, {"project": proj["id"], "item": item["itemId"], "field": field["id"], "option": option["id"]})
     if not ((body.get("data") or {}).get("updateProjectV2ItemFieldValue") or {}).get("projectV2Item"):
         raise RuntimeError(f"status not changed: {(body.get('errors') or [{}])[0].get('message', 'no answer')}")
+    patch_projects_cache(lambda items: [it.update(status=option["name"]) for it in items if it.get("itemId") == item["itemId"]])
+    return True
+
+
+def patch_projects_cache(change) -> None:
+    """Apply a write to the cached project lists, so the next refresh shows it without refetching."""
     try:
         cached = json.loads((CONFIG / "projects-cache.json").read_text())
-        for it in cached["items"]:
-            if it.get("itemId") == item["itemId"]:
-                it["status"] = option["name"]
+        change(cached["items"])
         (CONFIG / "projects-cache.json").write_text(json.dumps(cached))
     except OSError, json.JSONDecodeError, KeyError, TypeError:
         pass  # no cache: the next refresh fetches the projects anyway
+
+
+def sprint_target(p: dict, issue: Ref | None = None) -> dict:
+    """What a sprint write on sprint project p needs: the project and field ids, the current sprint, and with issue that issue's id."""
+    variables = {"owner": p["owner"], "number": int(p["number"]), "sprint": p["sprint"]}
+    if issue:
+        variables |= {"repoOwner": issue[0], "repo": issue[1], "issue": issue[2]}
+    data = graphql(SPRINT_ISSUE_TARGET_QUERY if issue else SPRINT_TARGET_QUERY, variables).get("data") or {}
+    proj = (data.get("repositoryOwner") or {}).get("projectV2") or {}
+    node = proj.get("sprintField") or {}
+    if not proj.get("id") or not node.get("id"):
+        raise RuntimeError(f'project {project_id(p)}: no iteration field "{p["sprint"]}"')
+    sprint = current_sprint(sprint_field_of(node, p["sprint"]), today())
+    if not sprint:
+        raise RuntimeError(f"project {project_id(p)}: no sprint has started")
+    target = {"project": proj["id"], "field": node["id"], "sprint": sprint}
+    if issue:
+        target["content"] = ((data.get("repository") or {}).get("issue") or {}).get("id")
+        if not target["content"]:
+            raise RuntimeError(f"{key_of(issue)}: issue not found")
+    return target
+
+
+def set_sprint(target: dict, item_id: str) -> None:
+    body = graphql(SET_ITERATION_MUTATION, {"project": target["project"], "item": item_id, "field": target["field"], "iteration": target["sprint"]["id"]})
+    if not ((body.get("data") or {}).get("updateProjectV2ItemFieldValue") or {}).get("projectV2Item"):
+        raise RuntimeError(f"sprint not set: {(body.get('errors') or [{}])[0].get('message', 'no answer')}")
+
+
+def join_current_sprint(card: dict) -> bool:
+    """Put an issue outside the sprint (no sprint, or planned for a later one) in the current sprint of its sprint project.
+
+    False when there is nothing to move: it is in the sprint already, or on no sprint project."""
+    item, sprint = card.get("sprintItem"), card.get("sprint")
+    p = next((p for p in PROJECTS if p.get("sprint") and item and project_id(p) == item["project"]), None)
+    if p is None or not sprint or sprint["state"] not in ("planned", "none"):
+        return False
+    target = sprint_target(p)
+    set_sprint(target, item["itemId"])
+    patch_projects_cache(lambda items: [it.update(sprint=dict(target["sprint"])) for it in items if it.get("itemId") == item["itemId"]])
     return True
+
+
+def add_to_sprint(issue: dict) -> str:
+    """Add an issue ({key, title, url}) to the first sprint project and put it in that project's current sprint; returns the sprint's title."""
+    p = next((p for p in PROJECTS if p.get("sprint")), None)
+    ref = ref_from_arg(issue["key"])
+    if p is None or ref is None:
+        raise ValueError("no sprint project in config.toml")
+    target = sprint_target(p, ref)
+    body = graphql(ADD_ITEM_MUTATION, {"project": target["project"], "content": target["content"]})
+    item_id = (((body.get("data") or {}).get("addProjectV2ItemById") or {}).get("item") or {}).get("id")
+    if not item_id:
+        raise RuntimeError(f"not added to project {project_id(p)}: {(body.get('errors') or [{}])[0].get('message', 'no answer')}")
+    set_sprint(target, item_id)
+    entry = {"key": issue["key"], "title": issue["title"], "url": issue["url"], "status": "", "isBacklog": p["is_backlog"], "project": project_id(p), "itemId": item_id}
+    patch_projects_cache(lambda items: items.append({**entry, "sprint": dict(target["sprint"])}) if all(it.get("itemId") != item_id for it in items) else None)
+    return target["sprint"]["title"]
 
 
 def resume_session(needle: str) -> dict:

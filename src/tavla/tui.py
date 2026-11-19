@@ -527,14 +527,15 @@ class AskPrompt(ModalScreen[tuple[str, bool, bool] | None]):
     """A session prompt: the box wraps and grows with the text, so a long prompt stays readable; enter submits.
 
     With progress_from, the issue's status, the box also offers to move the issue from it to In Progress
-    (ticked by default for Todo, unticked for any other status), and with offer_attach to attach to the new session (unticked by default); the answer is
+    (ticked by default for Todo, unticked for any other status), and into the sprint named by into_sprint when the issue is
+    outside it; with offer_attach it offers to attach to the new session (unticked by default). The answer is
     (prompt, move it, attach). With required, an empty prompt keeps the box open."""
 
     BINDINGS: ClassVar[list[BindingType]] = [Binding("escape", "cancel", "Cancel"), Binding("enter", "submit", "Start", priority=True)]
 
-    def __init__(self, question: str, progress_from: str = "", required: bool = False, offer_attach: bool = False) -> None:
+    def __init__(self, question: str, progress_from: str = "", required: bool = False, offer_attach: bool = False, into_sprint: str = "") -> None:
         super().__init__()
-        self.question, self.progress_from, self.required, self.offer_attach = question, progress_from, required, offer_attach
+        self.question, self.progress_from, self.required, self.offer_attach, self.into_sprint = question, progress_from, required, offer_attach, into_sprint
 
     def compose(self) -> ComposeResult:
         placeholder = "prompt" if self.required else "prompt (enter for the default pick-up prompt)"
@@ -542,7 +543,8 @@ class AskPrompt(ModalScreen[tuple[str, bool, bool] | None]):
             yield Label(f"{self.question}  [$text-muted]enter starts · ctrl+g editor · esc cancels[/]")
             yield PromptArea(id="prompt", placeholder=placeholder, soft_wrap=True, show_line_numbers=False)
             if self.progress_from:
-                yield Checkbox(f"Move the issue from {self.progress_from} to In Progress", value=self.progress_from == "Todo", id="to-progress")
+                sprint = f" and into {escape(self.into_sprint)}" if self.into_sprint else ""
+                yield Checkbox(f"Move the issue from {self.progress_from} to In Progress{sprint}", value=self.progress_from == "Todo", id="to-progress")
             if self.offer_attach:
                 yield Checkbox("Attach to the session (new terminal tab)", value=False, id="attach-now")
 
@@ -560,10 +562,16 @@ class AskPrompt(ModalScreen[tuple[str, bool, bool] | None]):
 
 
 class NewIssue(ModalScreen[dict | None]):
-    """Repo, title, optional body and assignment for a new issue; enter in the title or ctrl+s creates it."""
+    """Repo, title, optional body and assignment for a new issue; enter in the title or ctrl+s creates it.
+
+    With sprint, the current sprint of the first sprint project, it also offers to add the issue to that sprint (ticked)."""
 
     BINDINGS: ClassVar[list[BindingType]] = [Binding("escape", "cancel", "Cancel"), Binding("ctrl+s", "create", "Create", priority=True)]
     AUTO_FOCUS = "#issue-title"
+
+    def __init__(self, sprint: str = "") -> None:
+        super().__init__()
+        self.sprint = sprint
 
     def compose(self) -> ComposeResult:
         with Vertical(id="ask"):
@@ -574,6 +582,8 @@ class NewIssue(ModalScreen[dict | None]):
             yield WordInput(placeholder="title", id="issue-title")
             yield PromptArea(id="issue-body", placeholder="body (optional)")
             yield Checkbox("Assign to me, so it shows on the board", value=True, id="issue-assign")
+            if self.sprint:
+                yield Checkbox(f"Add to {escape(self.sprint)}", value=True, id="issue-sprint")
 
     @on(Input.Submitted)
     def submitted(self) -> None:
@@ -587,7 +597,8 @@ class NewIssue(ModalScreen[dict | None]):
             return
         repo = core.ISSUE_REPOS[self.query_one("#issue-repo", RadioSet).pressed_index][0]
         body = self.query_one("#issue-body", TextArea).text
-        self.dismiss({"repo": repo, "title": title, "body": body, "assign": self.query_one("#issue-assign", Checkbox).value})
+        sprint = bool(self.sprint) and self.query_one("#issue-sprint", Checkbox).value
+        self.dismiss({"repo": repo, "title": title, "body": body, "assign": self.query_one("#issue-assign", Checkbox).value, "sprint": sprint})
 
     def action_cancel(self) -> None:
         self.dismiss(None)
@@ -1237,7 +1248,15 @@ class BoardApp(App):
                 self.start_session(card, answer[0], attach=answer[2], progress=answer[1])
 
         progress_from = card["status"] if card.get("status") in core.NOT_STARTED and card.get("statusItem") else ""
-        self.push_screen(AskPrompt(f"New background session on {card['key']}", progress_from, offer_attach=True), go)
+        into = self.sprint_to_join(card)
+        self.push_screen(AskPrompt(f"New background session on {card['key']}", progress_from, offer_attach=True, into_sprint=into), go)
+
+    def sprint_to_join(self, card: dict) -> str:
+        """The current sprint a card outside the sprint moves into when work on it starts; empty for any other card."""
+        sprint, item = card.get("sprint"), card.get("sprintItem")
+        if not sprint or not item or sprint["state"] not in ("planned", "none"):
+            return ""
+        return next((s["title"] for s in self.data.get("sprints") or [] if s["project"] == item["project"]), "")
 
     @work(thread=True)
     def start_session(self, card: dict, prompt: str, attach: bool = False, progress: bool = False) -> None:
@@ -1254,6 +1273,12 @@ class BoardApp(App):
                 self.call_from_thread(self.action_refresh)
             except Exception as err:  # noqa: BLE001
                 self.call_from_thread(self.notify, f"Started, but could not move {card['key']} to In Progress: {err}", severity="error")
+            # Started work is never left outside the sprint, which would hide it from the board once its session goes.
+            try:
+                if core.join_current_sprint(card):
+                    self.call_from_thread(self.action_refresh)
+            except Exception as err:  # noqa: BLE001
+                self.call_from_thread(self.notify, f"Started, but could not move {card['key']} into the current sprint: {err}", severity="error")
         if attach:
             try:
                 core.attach(sid, card["title"])
@@ -1291,7 +1316,10 @@ class BoardApp(App):
             if spec:
                 self.create_issue(spec)
 
-        self.push_screen(NewIssue(), go)
+        # The sprint offered is the one core.add_to_sprint puts it in: the first sprint project's current sprint.
+        first = next((core.project_id(p) for p in core.PROJECTS if p.get("sprint")), None)
+        sprint = next((s["title"] for s in self.data.get("sprints") or [] if s["project"] == first), "")
+        self.push_screen(NewIssue(sprint), go)
 
     @work(thread=True)
     def create_issue(self, spec: dict) -> None:
@@ -1300,6 +1328,11 @@ class BoardApp(App):
         except Exception as err:  # noqa: BLE001
             self.call_from_thread(self.notify, f"Could not create the issue: {err}", severity="error")
             return
+        if spec.get("sprint"):
+            try:
+                core.add_to_sprint(issue)
+            except Exception as err:  # noqa: BLE001
+                self.call_from_thread(self.notify, f"Created {issue['key']}, but could not add it to the sprint: {err}", severity="error", timeout=15)
         self.call_from_thread(self.issue_created, issue)
 
     def issue_created(self, issue: dict) -> None:
