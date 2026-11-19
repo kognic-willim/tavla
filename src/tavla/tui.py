@@ -108,6 +108,7 @@ def short_ref(key: str, near: str = "") -> str:
 
 
 parent_slots: dict[str, int] = {}
+parent_keys: list[str] = []  # the parents on the board in a fixed order: the first nine answer to the keys 1-9
 
 
 def assign_parent_colors(cards: list[dict]) -> None:
@@ -115,7 +116,8 @@ def assign_parent_colors(cards: list[dict]) -> None:
 
     A parent keeps its colour between runs as long as the set of parents does not change around it."""
     parent_slots.clear()
-    for key in sorted({c["parent"]["key"] for c in cards if c.get("parent")}):
+    parent_keys[:] = sorted({c["parent"]["key"] for c in cards if c.get("parent")})
+    for key in parent_keys:
         slot = zlib.crc32(key.encode()) % len(PARENT_COLORS)
         free = [(slot + i) % len(PARENT_COLORS) for i in range(len(PARENT_COLORS)) if (slot + i) % len(PARENT_COLORS) not in parent_slots.values()]
         parent_slots[key] = free[0] if free else slot
@@ -125,11 +127,22 @@ def parent_color(key: str) -> str:
     return PARENT_COLORS[parent_slots.get(key, zlib.crc32(key.encode()) % len(PARENT_COLORS))]
 
 
+def parent_number(key: str) -> int | None:
+    """The key (1-9) that filters on this parent, for the first nine parents on the board."""
+    n = parent_keys.index(key) + 1 if key in parent_keys else 0
+    return n if 1 <= n <= 9 else None
+
+
+def parent_tag(key: str) -> str:
+    n = parent_number(key)
+    return f"[b]{n}[/b] " if n else ""
+
+
 def parent_chip(card: dict) -> str:
     parent = card.get("parent")
     if not parent:
         return ""
-    return f"[{parent_color(parent['key'])}]↳ {escape(short_ref(parent['key'], card['key']))} {escape(parent['title'])}[/]"
+    return f"[{parent_color(parent['key'])}]{parent_tag(parent['key'])}↳ {escape(short_ref(parent['key'], card['key']))} {escape(parent['title'])}[/]"
 
 
 def group_note(parent: dict | None) -> str:
@@ -137,7 +150,7 @@ def group_note(parent: dict | None) -> str:
         return ""
     sub = parent.get("subIssues") or {}
     progress = f"  [$text-muted]☑ {sub['completed']}/{sub['total']}[/]" if sub.get("total") else ""
-    return f"[{parent_color(parent['key'])}]{escape(short_ref(parent['key']))}[/]{progress}"
+    return f"[{parent_color(parent['key'])}]{parent_tag(parent['key'])}{escape(short_ref(parent['key']))}[/]{progress}"
 
 
 def labels_line(card: dict) -> str:
@@ -455,7 +468,7 @@ class FilterInput(WordInput):
     def action_clear(self) -> None:
         self.value = ""
         self.show(False)
-        self.app.action_back()
+        self.app.focus_board()
         if self.app.focused is None or self.app.focused is self:
             self.screen.focus_next(ListView)
 
@@ -575,7 +588,7 @@ class StopOrDelete(ModalScreen[str | None]):
         self.dismiss(None)
 
 
-BOARD_ACTIONS = {"search", "attach", "new", "new_unlinked", "new_issue", "open", "link", "unlink", "stop_delete", "hide", "show_hidden", "group", "view", "refresh", "back"}
+BOARD_ACTIONS = {"search", "attach", "new", "new_unlinked", "new_issue", "open", "link", "unlink", "stop_delete", "hide", "show_hidden", "group", "view", "parent", "refresh", "back"}
 
 
 CARD_CSS = """
@@ -690,6 +703,8 @@ class BoardApp(App):
         Binding("H", "show_hidden", "Show hidden", show=False),
         Binding("g", "group", "Grouping"),
         Binding("v", "view", "View"),
+        Binding("1", "parent(1)", "Parent", key_display="1-9"),
+        *(Binding(str(n), f"parent({n})", f"Parent {n}", show=False) for n in range(2, 10)),
         Binding("r", "refresh(True)", "Refresh", show=False),
         Binding("escape", "back", "Back", show=False),
         Binding("q", "quit", "Quit"),
@@ -700,6 +715,7 @@ class BoardApp(App):
         self.grouping = "status"
         self.view = "board"
         self.filter = ""
+        self.parent_filter: str | None = None  # the key of the parent issue picked with 1-9
         self.hidden = core.load_hidden()  # issue keys hidden from the board, kept in hidden.json
         self.show_hidden = False
         self.data: dict = {"cards": [], "unlinked": [], "fetchedAt": 0, "errors": []}
@@ -769,6 +785,8 @@ class BoardApp(App):
     async def show_board(self, data: dict) -> None:
         self.data = data
         assign_parent_colors([c for c in data["cards"] if not c.get("searchOnly")])
+        if self.parent_filter not in parent_keys:
+            self.parent_filter = None
         await self.fill_columns()
         self.update_status()
 
@@ -783,9 +801,13 @@ class BoardApp(App):
         d = self.data
         state = "refreshing…" if self.loading else f"updated {core.ago(d['fetchedAt'])} ago" if d["fetchedAt"] else "loading…"
         group = f"{self.view} view  ·  grouped by {GROUPINGS[self.grouping]}"
-        if self.filter:
+        if self.parent_filter:
+            title = next(c["parent"]["title"] for c in d["cards"] if (c.get("parent") or {}).get("key") == self.parent_filter)
+            group += f"  ·  parent [{parent_color(self.parent_filter)}]{parent_number(self.parent_filter)} {escape(fit(title, 40))}[/]"
+        if self.filter or self.parent_filter:
             shown = sum(1 for c in self.visible(d["cards"]) if self.show_hidden or c["key"] not in self.hidden)
-            group += f"  ·  filter [$accent]{escape(self.filter)}[/]: {shown} of {plural(len(d['cards']), 'issue')}"
+            text = f"filter [$accent]{escape(self.filter)}[/]: " if self.filter else ""
+            group += f"  ·  {text}{shown} of {plural(len(d['cards']), 'issue')}"
         if n_hidden := sum(1 for c in d["cards"] if c["key"] in self.hidden):
             group += f"  ·  {n_hidden} hidden ({'shown, ' if self.show_hidden else ''}H toggles)"
         errors = f"  ·  [$error]{len(d['errors'])} error(s): {escape(fit(d['errors'][0], 90))}[/]" if d["errors"] else ""
@@ -816,7 +838,7 @@ class BoardApp(App):
 
     async def replace_items(self, lv: ListView, rows: list[dict], make, keep: str | None) -> None:
         """Redraw a list only when its rows changed, keeping the highlighted row by key and the focus where it was."""
-        signature = json.dumps(rows, sort_keys=True, default=str) + self.grouping
+        signature = json.dumps(rows, sort_keys=True, default=str) + self.grouping + json.dumps(parent_slots, sort_keys=True)
         if self.signatures.get(lv.id or "") == signature:
             return
         self.signatures[lv.id or ""] = signature
@@ -844,10 +866,13 @@ class BoardApp(App):
                 lv.index = match
 
     def visible(self, rows: list[dict]) -> list[dict]:
-        """The rows to draw: a filter also reaches the search-only cards (finished issues that left the board)."""
-        if self.filter:
-            return [r for r in rows if core.matches(r, self.filter)]
-        return [r for r in rows if not r.get("searchOnly")]
+        """The rows to draw: a filter also reaches the search-only cards (finished issues that left the board).
+
+        A parent picked with 1-9 leaves only that issue and its sub-issues, so no unlinked session."""
+        rows = [r for r in rows if core.matches(r, self.filter)] if self.filter else [r for r in rows if not r.get("searchOnly")]
+        if self.parent_filter:
+            rows = [r for r in rows if "sessions" in r and self.parent_filter in (r["key"], (r.get("parent") or {}).get("key"))]
+        return rows
 
     def groups(self) -> list[dict]:
         cards = [{**c, "hidden": True} if c["key"] in self.hidden else c for c in self.visible(self.data["cards"])]
@@ -1073,7 +1098,25 @@ class BoardApp(App):
         except Exception as err:  # noqa: BLE001
             self.call_from_thread(self.notify, f"Attach failed: {err}", severity="error")
 
-    def action_back(self) -> None:
+    async def action_parent(self, number: int) -> None:
+        """Show only the sub-issues of the numbered parent (and the parent's own card); the same key again shows everything."""
+        if number > len(parent_keys):
+            self.notify(f"No parent issue {number} on the board.")
+            return
+        key = parent_keys[number - 1]
+        self.parent_filter = None if self.parent_filter == key else key
+        await self.fill_columns()
+        self.update_status()
+
+    async def action_back(self) -> None:
+        if self.parent_filter and not self.query_one("#sessions", ListView).has_focus:
+            self.parent_filter = None
+            await self.fill_columns()
+            self.update_status()
+            return
+        self.focus_board()
+
+    def focus_board(self) -> None:
         cur = self.current_key()
         for lv in self.query(".col ListView").results(ListView):
             if any(self.item_key(it) == cur for it in lv.children):
@@ -1095,7 +1138,7 @@ class BoardApp(App):
         await self.build_columns()
         await self.fill_columns()
         self.update_status()
-        self.action_back()
+        self.focus_board()
 
     async def action_hide(self) -> None:
         card = self.current if self.current and "sessions" in self.current else None

@@ -1741,14 +1741,14 @@ def test_tui_card_and_list_row_name_the_parent_issue():
         async with app.run_test(size=(190, 45)) as pilot:
             await app.workers.wait_for_complete()
             await pilot.pause()
-            assert str(app.query_one("#col-blocked CardItem .card-parent").render()) == "↳ platform #2 Reliable rollouts"
+            assert str(app.query_one("#col-blocked CardItem .card-parent").render()) == "2 ↳ platform #2 Reliable rollouts"
             todo = {c.card["key"]: c for c in app.query("#col-todo CardItem")}
-            assert str(todo["acme/infra#11"].query_one(".card-parent").render()) == "↳ #9 Assigned but untouched"  # same repository: the number is enough
+            assert str(todo["acme/infra#11"].query_one(".card-parent").render()) == "1 ↳ #9 Assigned but untouched"  # same repository: the number is enough
             assert not todo["acme/charts#3"].query(".card-parent")
             await pilot.press("v")
             await pilot.pause()
             rows = {r.card["key"]: r for r in app.query(tui.CardRow)}
-            assert str(rows["acme/infra#7"].query_one(".c-parent").render()) == "↳ platform #2 Reliable rollouts"
+            assert str(rows["acme/infra#7"].query_one(".c-parent").render()) == "2 ↳ platform #2 Reliable rollouts"
             assert str(rows["acme/charts#3"].query_one(".c-parent").render()) == ""
 
     asyncio.run(scenario())
@@ -1769,13 +1769,51 @@ def test_tui_list_view_groups_by_parent_issue_and_the_board_does_not():
             await pilot.pause()
             assert app.grouping == "parent" and "grouped by parent issue" in str(app.query_one("#status").render())
             heads = [(r.group["title"], r.group["count"], str(r.query_one(".group-note").render())) for r in app.query(tui.GroupRow)]
-            assert heads == [("Reliable rollouts", 1, "platform #2  ☑ 1/4"), ("Assigned but untouched", 2, "infra #9  ☑ 0/1"), ("No parent", 1, ""), ("Unlinked", 1, "")]
+            assert heads == [("Reliable rollouts", 1, "2 platform #2  ☑ 1/4"), ("Assigned but untouched", 2, "1 infra #9  ☑ 0/1"), ("No parent", 1, ""), ("Unlinked", 1, "")]
             rows = {r.card["key"]: r for r in app.query(tui.CardRow)}
             cells = [str(lb.render()) for lb in rows["acme/infra#7"].query("Label")]
             assert "Blocked" in cells and not any("Reliable" in c for c in cells)  # the heading names the parent, the row keeps its status
             await pilot.press("v")  # back on the board the columns are by status again
             await pilot.pause()
             assert app.grouping == "status" and app.query_one("#count-blocked")
+
+    asyncio.run(scenario())
+
+
+def test_tui_number_keys_filter_on_a_parent_issue():
+    from tavla import tui
+
+    async def scenario():
+        app = tui.BoardApp()
+        async with app.run_test(size=(190, 45)) as pilot:
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+
+            def shown():
+                return sorted(c.card["key"] for c in app.query(tui.CardItem)), len(app.query(tui.SessItem))
+
+            everything = shown()
+            assert everything[1] == 1
+            await pilot.press("1")  # acme/infra#9, the first parent in key order
+            await pilot.pause()
+            assert shown() == (["acme/infra#11", "acme/infra#9"], 0)  # the parent's own card stays, unlinked sessions go
+            status = str(app.query_one("#status").render())
+            assert "parent 1 Assigned but untouched" in status and "2 of " in status
+            await pilot.press("2")  # another parent replaces the first
+            await pilot.pause()
+            assert shown() == (["acme/infra#7"], 0)
+            await pilot.press("v")  # the list view keeps the filter
+            await pilot.pause()
+            assert [r.card["key"] for r in app.query(tui.CardRow)] == ["acme/infra#7"]
+            await pilot.press("v", "2")  # the same key again shows everything
+            await pilot.pause()
+            assert shown() == everything and "parent" not in str(app.query_one("#status").render()).split("grouped by")[1]
+            await pilot.press("1", "escape")  # so does esc
+            await pilot.pause()
+            assert shown() == everything and app.parent_filter is None
+            await pilot.press("5")
+            await pilot.pause()
+            assert shown() == everything  # no fifth parent: nothing changes
 
     asyncio.run(scenario())
 
