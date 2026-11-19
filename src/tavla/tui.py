@@ -848,12 +848,12 @@ class BoardApp(App):
         if self.parent_filter:
             title = next(c["parent"]["title"] for c in d["cards"] if (c.get("parent") or {}).get("key") == self.parent_filter)
             group += f"  ·  parent [{parent_color(self.parent_filter)}]{parent_number(self.parent_filter)} {escape(fit(title, 40))}[/]"
-        # Issues outside the sprint count nowhere while s leaves them out.
+        # Issues outside the sprint count nowhere while s leaves them out, except against a search, which reaches them.
         cards = [c for c in d["cards"] if self.show_outside or not c.get("sprintFiltered")]
         if self.filter or self.parent_filter:
             shown = sum(1 for c in self.visible(d["cards"]) if self.show_hidden or c["key"] not in self.hidden)
             text = f"filter [$accent]{escape(self.filter)}[/]: " if self.filter else ""
-            group += f"  ·  {text}{shown} of {plural(len(cards), 'issue')}"
+            group += f"  ·  {text}{shown} of {plural(len(d['cards'] if self.filter else cards), 'issue')}"
         if n_hidden := sum(1 for c in cards if c["key"] in self.hidden):
             group += f"  ·  {n_hidden} hidden ({'shown, ' if self.show_hidden else ''}H toggles)"
         group += self.sprint_status()
@@ -1210,21 +1210,21 @@ class BoardApp(App):
             return
         self.hidden = core.toggle_hidden(card["key"])
         hiding = card["key"] in self.hidden
-        await self.refill_hidden()
+        await self.refill_after_toggle()
         self.notify((f"Hid {card['key']}" + ("" if self.show_hidden else "; H shows hidden issues")) if hiding else f"Unhid {card['key']}")
 
     async def action_show_hidden(self) -> None:
         self.show_hidden = not self.show_hidden
-        await self.refill_hidden()
+        await self.refill_after_toggle()
 
     async def action_show_outside(self) -> None:
         if not has_sprints():
             self.notify(f'No sprint project: add sprint = "<iteration field>" to a [[projects]] entry in {core.CONFIG / "config.toml"}.', severity="warning", timeout=10)
             return
         self.show_outside = not self.show_outside
-        await self.refill_hidden()
+        await self.refill_after_toggle()
 
-    async def refill_hidden(self) -> None:
+    async def refill_after_toggle(self) -> None:
         await self.fill_columns()
         # A card that just went hidden (or out with s) left its list: follow the highlight to the row that took its place.
         lv = self.focused
@@ -1248,15 +1248,8 @@ class BoardApp(App):
                 self.start_session(card, answer[0], attach=answer[2], progress=answer[1])
 
         progress_from = card["status"] if card.get("status") in core.NOT_STARTED and card.get("statusItem") else ""
-        into = self.sprint_to_join(card)
+        into = core.sprint_to_join(card, self.data)
         self.push_screen(AskPrompt(f"New background session on {card['key']}", progress_from, offer_attach=True, into_sprint=into), go)
-
-    def sprint_to_join(self, card: dict) -> str:
-        """The current sprint a card outside the sprint moves into when work on it starts; empty for any other card."""
-        sprint, item = card.get("sprint"), card.get("sprintItem")
-        if not sprint or not item or sprint["state"] not in ("planned", "none"):
-            return ""
-        return next((s["title"] for s in self.data.get("sprints") or [] if s["project"] == item["project"]), "")
 
     @work(thread=True)
     def start_session(self, card: dict, prompt: str, attach: bool = False, progress: bool = False) -> None:
@@ -1273,7 +1266,7 @@ class BoardApp(App):
                 self.call_from_thread(self.action_refresh)
             except Exception as err:  # noqa: BLE001
                 self.call_from_thread(self.notify, f"Started, but could not move {card['key']} to In Progress: {err}", severity="error")
-            # Started work is never left outside the sprint, which would hide it from the board once its session goes.
+            # Moving it to In Progress moves it into the sprint too, so it doesn't leave the board once its session goes.
             try:
                 if core.join_current_sprint(card):
                     self.call_from_thread(self.action_refresh)
@@ -1316,10 +1309,8 @@ class BoardApp(App):
             if spec:
                 self.create_issue(spec)
 
-        # The sprint offered is the one core.add_to_sprint puts it in: the first sprint project's current sprint.
-        first = next((core.project_id(p) for p in core.PROJECTS if p.get("sprint")), None)
-        sprint = next((s["title"] for s in self.data.get("sprints") or [] if s["project"] == first), "")
-        self.push_screen(NewIssue(sprint), go)
+        first = core.first_sprint_project()
+        self.push_screen(NewIssue(core.current_sprint_title(self.data, core.project_id(first)) if first else ""), go)
 
     @work(thread=True)
     def create_issue(self, spec: dict) -> None:

@@ -911,7 +911,7 @@ def _build_board(force: bool, offline: bool) -> dict:
         # Closed issues are exempt: the project lists hold open issues only.
         sprint, sprint_item = issue_sprint(on_sprint_projects[key], current, day) if iss["isOpen"] and key in on_sprint_projects else (None, None)
         # Outside the sprint, an issue leaves the board unless a session is on it; a search still finds it.
-        sprint_filtered = bool(sprint) and sprint["state"] in ("planned", "none") and not ss and not search_only
+        sprint_filtered = is_outside(sprint) and not ss and not search_only
         m = meta.get(key, {})
         prs = {p["key"]: p for p in [*m.get("prs", []), *(p for s in ss for p in s["prs"])]}
         cards.append(
@@ -1162,16 +1162,27 @@ def start_progress(card: dict) -> bool:
         raise RuntimeError(f"project {item['project']} has no Status option In Progress")
     body = graphql(SET_STATUS_MUTATION, {"project": proj["id"], "item": item["itemId"], "field": field["id"], "option": option["id"]})
     if not ((body.get("data") or {}).get("updateProjectV2ItemFieldValue") or {}).get("projectV2Item"):
-        raise RuntimeError(f"status not changed: {(body.get('errors') or [{}])[0].get('message', 'no answer')}")
-    patch_projects_cache(lambda items: [it.update(status=option["name"]) for it in items if it.get("itemId") == item["itemId"]])
+        raise RuntimeError(f"status not changed: {first_error(body)}")
+    patch_projects_cache(item["itemId"], {"status": option["name"]})
     return True
 
 
-def patch_projects_cache(change) -> None:
-    """Apply a write to the cached project lists, so the next refresh shows it without refetching."""
+def first_error(body: dict) -> str:
+    return (body.get("errors") or [{}])[0].get("message", "no answer")
+
+
+def patch_projects_cache(item_id: str, fields: dict, new: dict | None = None) -> None:
+    """Apply a write to the cached project lists, so the next refresh shows it without refetching:
+    set fields on the item, or add new with them when the cache doesn't hold the item yet."""
     try:
         cached = json.loads((CONFIG / "projects-cache.json").read_text())
-        change(cached["items"])
+        found = False
+        for it in cached["items"]:
+            if it.get("itemId") == item_id:
+                it.update(fields)
+                found = True
+        if not found and new is not None:
+            cached["items"].append({**new, **fields})
         (CONFIG / "projects-cache.json").write_text(json.dumps(cached))
     except OSError, json.JSONDecodeError, KeyError, TypeError:
         pass  # no cache: the next refresh fetches the projects anyway
@@ -1201,26 +1212,46 @@ def sprint_target(p: dict, issue: Ref | None = None) -> dict:
 def set_sprint(target: dict, item_id: str) -> None:
     body = graphql(SET_ITERATION_MUTATION, {"project": target["project"], "item": item_id, "field": target["field"], "iteration": target["sprint"]["id"]})
     if not ((body.get("data") or {}).get("updateProjectV2ItemFieldValue") or {}).get("projectV2Item"):
-        raise RuntimeError(f"sprint not set: {(body.get('errors') or [{}])[0].get('message', 'no answer')}")
+        raise RuntimeError(f"sprint not set: {first_error(body)}")
+
+
+def is_outside(sprint: dict | None) -> bool:
+    """Outside the sprint: on a sprint project with no sprint, or planned for one that hasn't started. None is on no sprint project."""
+    return bool(sprint) and sprint["state"] in ("planned", "none")
+
+
+def first_sprint_project() -> dict | None:
+    """The sprint project new issues go into, and whose current sprint the status line names."""
+    return next((p for p in PROJECTS if p.get("sprint")), None)
+
+
+def current_sprint_title(board: dict, project: str) -> str:
+    """The title of a sprint project's current sprint on the board; empty when none is known (no sprint started, or its field unread)."""
+    return next((s["title"] for s in board.get("sprints") or [] if s["project"] == project), "")
+
+
+def sprint_to_join(card: dict, board: dict) -> str:
+    """The current sprint join_current_sprint would put the card in; empty when it is in the sprint or on no sprint project."""
+    return current_sprint_title(board, card["sprintItem"]["project"]) if is_outside(card.get("sprint")) and card.get("sprintItem") else ""
 
 
 def join_current_sprint(card: dict) -> bool:
     """Put an issue outside the sprint (no sprint, or planned for a later one) in the current sprint of its sprint project.
 
     False when there is nothing to move: it is in the sprint already, or on no sprint project."""
-    item, sprint = card.get("sprintItem"), card.get("sprint")
+    item = card.get("sprintItem")
     p = next((p for p in PROJECTS if p.get("sprint") and item and project_id(p) == item["project"]), None)
-    if p is None or not sprint or sprint["state"] not in ("planned", "none"):
+    if p is None or not is_outside(card.get("sprint")):
         return False
     target = sprint_target(p)
     set_sprint(target, item["itemId"])
-    patch_projects_cache(lambda items: [it.update(sprint=dict(target["sprint"])) for it in items if it.get("itemId") == item["itemId"]])
+    patch_projects_cache(item["itemId"], {"sprint": target["sprint"]})
     return True
 
 
 def add_to_sprint(issue: dict) -> str:
     """Add an issue ({key, title, url}) to the first sprint project and put it in that project's current sprint; returns the sprint's title."""
-    p = next((p for p in PROJECTS if p.get("sprint")), None)
+    p = first_sprint_project()
     ref = ref_from_arg(issue["key"])
     if p is None or ref is None:
         raise ValueError("no sprint project in config.toml")
@@ -1228,10 +1259,10 @@ def add_to_sprint(issue: dict) -> str:
     body = graphql(ADD_ITEM_MUTATION, {"project": target["project"], "content": target["content"]})
     item_id = (((body.get("data") or {}).get("addProjectV2ItemById") or {}).get("item") or {}).get("id")
     if not item_id:
-        raise RuntimeError(f"not added to project {project_id(p)}: {(body.get('errors') or [{}])[0].get('message', 'no answer')}")
+        raise RuntimeError(f"not added to project {project_id(p)}: {first_error(body)}")
     set_sprint(target, item_id)
     entry = {"key": issue["key"], "title": issue["title"], "url": issue["url"], "status": "", "isBacklog": p["is_backlog"], "project": project_id(p), "itemId": item_id}
-    patch_projects_cache(lambda items: items.append({**entry, "sprint": dict(target["sprint"])}) if all(it.get("itemId") != item_id for it in items) else None)
+    patch_projects_cache(item_id, {"sprint": target["sprint"]}, new=entry)
     return target["sprint"]["title"]
 
 
