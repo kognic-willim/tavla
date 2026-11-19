@@ -2003,3 +2003,99 @@ def test_dump_leaves_issues_outside_the_sprint_out_and_json_marks_them_search_on
     assert core.main(["dump"]) == 0
     out = capsys.readouterr().out
     assert "Next up" not in out and "Assigned but untouched" not in out and "Deploy is flaky" in out
+
+
+def test_tui_cards_outside_the_current_sprint_carry_a_sprint_chip_warning_where_something_is_off(sprints):
+    from tavla import tui
+
+    core.link("cccc3333", "acme/infra#14")  # planned, kept by a session
+    core.link("cccc3333", "acme/infra#9")  # no sprint and not started, kept by a session
+
+    async def scenario():
+        app = tui.BoardApp()
+        async with app.run_test(size=(190, 45)) as pilot:
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            meta = {it.card["key"]: "".join(str(lb.content) for lb in it.query(".card-meta")) for it in app.query(tui.CardItem)}
+            assert "[$warning]Sprint 14[/]" in meta["acme/infra#13"]  # a leftover
+            assert "[$warning]no sprint[/]" in meta["acme/charts#3"]  # started work with no sprint
+            assert "[$text-muted]no sprint[/]" in meta["acme/infra#9"]  # plain backlog
+            assert "[$text-muted]Sprint 16[/]" in meta["acme/infra#14"]  # planning
+            assert "Sprint" not in meta["acme/infra#7"] and "sprint" not in meta["acme/infra#11"]  # current sprint, no sprint project
+
+            await pilot.press("v")
+            await pilot.pause()
+            assert [str(lb.render()) for lb in app.query_one(".list-head").query(tui.Label)][3:5] == ["Status", "Sprint"]
+            rows = {r.card["key"]: str(r.query_one(".c-sprint").content) for r in app.query(tui.CardRow)}
+            assert rows["acme/infra#13"] == "[$warning]Sprint 14[/]" and rows["acme/infra#7"] == ""
+
+    asyncio.run(scenario())
+
+
+def test_tui_s_shows_the_issues_outside_the_sprint_dimmed_and_the_status_line_counts_them(sprints):
+    from tavla import tui
+
+    async def scenario():
+        app = tui.BoardApp()
+        async with app.run_test(size=(190, 45)) as pilot:
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+
+            def keys():
+                return {it.card["key"]: it.has_class("is-outside") for it in app.query(tui.CardItem)}
+
+            assert "acme/infra#14" not in keys() and "acme/infra#9" not in keys()
+            status = str(app.query_one("#status").content)
+            assert "Sprint 15 · 13 days left · 2 outside" in status
+            await pilot.press("s")
+            await pilot.pause()
+            assert keys()["acme/infra#14"] and keys()["acme/infra#9"] and not keys()["acme/infra#13"]
+            assert "2 outside (shown, s toggles)" in str(app.query_one("#status").content)
+            await pilot.press("v")
+            await pilot.pause()
+            assert next(r for r in app.query(tui.CardRow) if r.card["key"] == "acme/infra#14").has_class("is-outside")
+            assert len(app.query_one(tui.SessRow).query(tui.Label)) == len(app.query_one(".list-head").query(tui.Label))  # unlinked rows keep the cells lined up
+            await pilot.press("s")
+            await pilot.pause()
+            assert "acme/infra#14" not in [r.card["key"] for r in app.query(tui.CardRow)]
+
+            await pilot.press("v", "slash", *"next up")  # a search finds them with s off
+            await pilot.pause()
+            assert list(keys()) == ["acme/infra#14"]
+
+    asyncio.run(scenario())
+
+
+def test_tui_parent_numbers_ignore_cards_outside_the_sprint(sprints):
+    from tavla import tui
+
+    async def scenario():
+        app = tui.BoardApp()
+        async with app.run_test(size=(190, 45)) as pilot:
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            todo = {c.card["key"]: c for c in app.query("#col-todo CardItem")}
+            # The parent's own card is outside the sprint; its sub-issue still names it, and 1 filters on it.
+            assert str(todo["acme/infra#11"].query_one(".card-parent").render()) == "1 ↳ #9 Assigned but untouched"
+            await pilot.press("1")
+            await pilot.pause()
+            assert [c.card["key"] for c in app.query(tui.CardItem)] == ["acme/infra#11"]
+            assert "1 of 7 issues" in str(app.query_one("#status").content)  # 9 cards, less the two outside the sprint
+
+    asyncio.run(scenario())
+
+
+def test_tui_without_a_sprint_project_has_no_sprint_cell_and_s_says_which_key_to_add():
+    from tavla import tui
+
+    async def scenario():
+        app = tui.BoardApp()
+        async with app.run_test(size=(190, 45)) as pilot:
+            await app.workers.wait_for_complete()
+            await pilot.press("s", "v")
+            await pilot.pause()
+            assert any('sprint = "' in str(n.message) for n in app._notifications)
+            assert "Sprint" not in [str(lb.render()) for lb in app.query_one(".list-head").query(tui.Label)]
+            assert not app.query(".c-sprint") and "outside" not in str(app.query_one("#status").content)
+
+    asyncio.run(scenario())
