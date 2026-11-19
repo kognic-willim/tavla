@@ -171,6 +171,9 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setattr(core, "ISSUE_REPOS", [("me/todo", "Personal"), ("team/tracker", "Team")])
     monkeypatch.setattr(core, "SESSION_CWD", tmp_path)
     monkeypatch.setattr(core, "THEME", "tavla")
+    from tavla import tui
+
+    tui.use_palette(dark=True)
     monkeypatch.setattr(core, "TERMINAL", "iterm2")
     monkeypatch.setattr(core, "run", fake_run)
     monkeypatch.setattr(core, "graphql", fake_graphql)
@@ -1840,15 +1843,135 @@ def test_tui_number_keys_filter_on_a_parent_issue():
     asyncio.run(scenario())
 
 
-def test_tui_parents_on_the_board_get_distinct_colours():
+def test_tui_parents_on_the_board_get_distinct_colours_in_dark_and_light_themes():
     from tavla import tui
 
     keys = [f"acme/infra#{n}" for n in range(1, 9)]
     tui.assign_parent_colors([{"parent": {"key": k}} for k in keys] + [{"parent": None}])
-    assert len({tui.parent_color(k) for k in keys}) == 8
+    assert {tui.parent_color(k) for k in keys} == DARK_PARENTS
     first = {k: tui.parent_color(k) for k in keys}
+    tui.use_palette(dark=False)
+    assert {tui.parent_color(k) for k in keys} == SOLARIZED_PARENTS
+    light = {k: tui.parent_color(k) for k in keys}
     tui.assign_parent_colors([{"parent": {"key": k}} for k in reversed(keys)])
-    assert {k: tui.parent_color(k) for k in keys} == first  # the same set of parents gets the same colours
+    assert {k: tui.parent_color(k) for k in keys} == light  # the same set of parents gets the same colours
+    tui.use_palette(dark=True)
+    assert {k: tui.parent_color(k) for k in keys} == first
+
+
+DARK_PARENTS = {"#6cb6ff", "#f69d50", "#dcbdfb", "#57c4b8", "#f47067", "#c6d05a", "#e275ad", "#96a8f8"}
+SOLARIZED_PARENTS = {"#268bd2", "#cb4b16", "#6c71c4", "#2aa198", "#dc322f", "#b58900", "#d33682", "#859900"}
+
+
+def drawn_colour(widget, text: str) -> str | None:
+    """The colour a widget draws the first piece of its text containing `text` in, as the terminal gets it."""
+    for y in range(widget.region.height):
+        for seg in widget.render_line(y):
+            if text in seg.text and seg.style and seg.style.color and seg.style.color.triplet:
+                return seg.style.color.triplet.hex
+    return None
+
+
+@pytest.mark.parametrize(("theme", "parents", "merged", "selected_darker"), [("tavla", DARK_PARENTS, "#a371f7", False), ("solarized-light", SOLARIZED_PARENTS, "#6c71c4", True)])
+def test_tui_parent_and_merged_colours_and_the_selected_card_suit_a_dark_or_light_theme(monkeypatch, theme, parents, merged, selected_darker):
+    from textual.color import Color
+
+    from tavla import tui
+
+    monkeypatch.setattr(core, "THEME", theme)
+
+    async def scenario():
+        app = tui.BoardApp()
+        async with app.run_test(size=(190, 45)) as pilot:
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            cards = {c.card["key"]: c for c in app.query(tui.CardItem)}
+            assert drawn_colour(cards["acme/infra#7"].query_one(".card-parent"), "Reliable") in parents
+            assert drawn_colour(cards["acme/charts#3"].query_one(".card-meta"), "⎇") == merged
+            col = app.query_one("#col-todo", tui.CardList)
+            col.focus()
+            await pilot.press("down", "down")  # past the session card onto acme/infra#9
+            await pilot.wait_for_scheduled_animations()
+            await pilot.pause()
+            surface = Color.parse(app.get_css_variables()["surface"])
+            selected, other = cards["acme/infra#9"].styles.background, cards["acme/infra#11"].styles.background
+            assert other == surface
+            assert (selected.brightness < surface.brightness) == selected_darker and selected != surface
+            await pilot.press("up")  # the session card selected still stands out from one that isn't
+            await pilot.wait_for_scheduled_animations()
+            await pilot.pause()
+            assert cards["acme/charts#3"].styles.background != cards["acme/infra#7"].styles.background
+            await pilot.press("v")  # the list view's selected row, once the focus is in the sessions panel
+            await pilot.pause()
+            app.query_one("#sessions", tui.CardList).focus()
+            await pilot.wait_for_scheduled_animations()
+            await pilot.pause()
+            row = app.query_one("#col-list", tui.CardList).highlighted_child
+            assert isinstance(row, tui.CardRow) and (row.styles.background.brightness < surface.brightness) == selected_darker and row.styles.background != surface
+
+    asyncio.run(scenario())
+
+
+def test_tui_session_cards_are_tinted_green_not_in_the_blue_of_a_selection_under_a_light_theme(monkeypatch):
+    from tavla import tui
+
+    monkeypatch.setattr(core, "THEME", "solarized-light")
+
+    async def scenario():
+        app = tui.BoardApp()
+        async with app.run_test(size=(190, 45)) as pilot:
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            for item in [*app.query(tui.CardItem).filter(".has-session"), *app.query(tui.SessItem)]:
+                bg = item.styles.background
+                assert bg.b < min(bg.r, bg.g), item  # a yellow-green tint, not blue
+
+    asyncio.run(scenario())
+
+
+def test_tui_picking_a_light_theme_with_ctrl_p_recolours_the_board_without_asking_github_or_claude(monkeypatch):
+    from contextlib import suppress
+
+    from textual.css.query import NoMatches
+
+    from tavla import tui
+
+    async def scenario():
+        app = tui.BoardApp()
+        async with app.run_test(size=(190, 45)) as pilot:
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            calls = []
+            monkeypatch.setattr(core, "run", lambda *a, **k: calls.append(a))
+            monkeypatch.setattr(core, "graphql", lambda *a, **k: calls.append(a))
+            await pilot.press("1")  # filter on acme/infra#9, then select its sub-issue
+            col = app.query_one("#col-todo", tui.CardList)
+            col.focus()
+            await pilot.press("down", "down")
+            await pilot.pause()
+            assert app.current_key() == "card:acme/infra#11"
+            assert drawn_colour(app.query_one("#col-todo CardItem .card-parent"), "Assigned") in DARK_PARENTS
+
+            async def until(done):
+                for _ in range(100):
+                    await app.workers.wait_for_complete()
+                    await pilot.pause(0.05)
+                    with suppress(NoMatches):  # the palette is not up yet
+                        if done():
+                            return
+                raise AssertionError("timed out")
+
+            await pilot.press("ctrl+p", *"theme")
+            await until(lambda: "Change the current theme" in str(app.screen.query_one("CommandList").get_option_at_index(0).prompt))
+            await pilot.press("enter", *"solarized-light")
+            await until(lambda: str(app.screen.query_one("CommandList").get_option_at_index(0).prompt) == "solarized-light")
+            await pilot.press("enter")
+            await until(lambda: app.theme == "solarized-light" and app.screen.id == "_default")
+            assert drawn_colour(app.query_one("#col-todo CardItem .card-parent"), "Assigned") in SOLARIZED_PARENTS
+            assert app.parent_filter == "acme/infra#9" and app.current_key() == "card:acme/infra#11" and app.view == "board"
+            assert calls == []
+
+    asyncio.run(scenario())
 
 
 def test_metadata_cached_without_a_parent_is_fetched_again_at_once():
