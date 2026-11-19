@@ -1901,11 +1901,22 @@ def test_tui_parent_and_merged_colours_and_the_selected_card_suit_a_dark_or_ligh
             await pilot.wait_for_scheduled_animations()
             await pilot.pause()
             assert cards["acme/charts#3"].styles.background != cards["acme/infra#7"].styles.background
+            await pilot.press("v")  # the list view's selected row, once the focus is in the sessions panel
+            await pilot.pause()
+            app.query_one("#sessions", tui.CardList).focus()
+            await pilot.wait_for_scheduled_animations()
+            await pilot.pause()
+            row = app.query_one("#col-list", tui.CardList).highlighted_child
+            assert isinstance(row, tui.CardRow) and (row.styles.background.brightness < surface.brightness) == selected_darker and row.styles.background != surface
 
     asyncio.run(scenario())
 
 
 def test_tui_picking_a_light_theme_with_ctrl_p_recolours_the_board_without_asking_github_or_claude(monkeypatch):
+    from contextlib import suppress
+
+    from textual.css.query import NoMatches
+
     from tavla import tui
 
     async def scenario():
@@ -1923,14 +1934,22 @@ def test_tui_picking_a_light_theme_with_ctrl_p_recolours_the_board_without_askin
             await pilot.pause()
             assert app.current_key() == "card:acme/infra#11"
             assert drawn_colour(app.query_one("#col-todo CardItem .card-parent"), "Assigned") in DARK_PARENTS
+
+            async def until(done):
+                for _ in range(100):
+                    await app.workers.wait_for_complete()
+                    await pilot.pause(0.05)
+                    with suppress(NoMatches):  # the palette is not up yet
+                        if done():
+                            return
+                raise AssertionError("timed out")
+
             await pilot.press("ctrl+p", *"theme")
-            await pilot.pause(0.3)
+            await until(lambda: "Change the current theme" in str(app.screen.query_one("CommandList").get_option_at_index(0).prompt))
             await pilot.press("enter", *"solarized-light")
-            await pilot.pause(0.3)
+            await until(lambda: str(app.screen.query_one("CommandList").get_option_at_index(0).prompt) == "solarized-light")
             await pilot.press("enter")
-            await pilot.pause(0.3)
-            await app.workers.wait_for_complete()
-            assert app.theme == "solarized-light"
+            await until(lambda: app.theme == "solarized-light" and app.screen.id == "_default")
             assert drawn_colour(app.query_one("#col-todo CardItem .card-parent"), "Assigned") in SOLARIZED_PARENTS
             assert app.parent_filter == "acme/infra#9" and app.current_key() == "card:acme/infra#11" and app.view == "board"
             assert calls == []
