@@ -672,9 +672,11 @@ class BoardApp(App):
     ListView.cards > ListItem.card.has-session {{ background: $primary 18%; border: round $primary 60%; }}
     ListView.cards > ListItem.card.has-session.-highlight {{ background: $primary 28%; }}
     ListView.cards:focus > ListItem.card.has-session.-highlight {{ background: $primary 28%; border: round $accent; }}
-    /* A light theme darkens the selection instead; the has-session and focused-row rules are repeated to outrank it. */
+    /* A light theme darkens the selection instead, and tints session cards green rather than in $primary, which is the
+       blue of a selection there; the focused-row rule is repeated to outrank these. */
     App.-light-mode ListView.cards > ListItem.card.-highlight {{ background: $surface-darken-1; }}
-    App.-light-mode ListView.cards > ListItem.card.has-session.-highlight {{ background: $primary 28%; }}
+    App.-light-mode ListView.cards > ListItem.card.has-session {{ background: $success 18%; border: round $success 60%; }}
+    App.-light-mode ListView.cards > ListItem.card.has-session.-highlight {{ background: $success 28%; }}
     .card-title {{ width: 1fr; text-style: bold; margin-bottom: 1; }}
     .card-ref {{ height: 1; }}
     .card-icon {{ width: auto; margin-right: 1; }}

@@ -1912,6 +1912,23 @@ def test_tui_parent_and_merged_colours_and_the_selected_card_suit_a_dark_or_ligh
     asyncio.run(scenario())
 
 
+def test_tui_session_cards_are_tinted_green_not_in_the_blue_of_a_selection_under_a_light_theme(monkeypatch):
+    from tavla import tui
+
+    monkeypatch.setattr(core, "THEME", "solarized-light")
+
+    async def scenario():
+        app = tui.BoardApp()
+        async with app.run_test(size=(190, 45)) as pilot:
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            for item in [*app.query(tui.CardItem).filter(".has-session"), *app.query(tui.SessItem)]:
+                bg = item.styles.background
+                assert bg.b < min(bg.r, bg.g), item  # a yellow-green tint, not blue
+
+    asyncio.run(scenario())
+
+
 def test_tui_picking_a_light_theme_with_ctrl_p_recolours_the_board_without_asking_github_or_claude(monkeypatch):
     from contextlib import suppress
 

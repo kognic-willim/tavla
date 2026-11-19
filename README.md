@@ -35,7 +35,7 @@ Tavla works without configuration: the board then shows the open issues assigned
 session_dir = "~/Code/my-notes"
 
 # "tavla" (the default) or any built-in Textual theme, e.g. "nord" or "textual-light". For a light terminal pick
-# "solarized-light": under any light theme the parent colours, merged PRs and the selected card adapt to the light background.
+# "solarized-light": under any light theme the parent colours, merged PRs, session cards and the selected card adapt to the light background.
 # A theme picked with ctrl+p recolours the board at once but is not saved: the next start uses this one.
 theme = "tavla"
 
