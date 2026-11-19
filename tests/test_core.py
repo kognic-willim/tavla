@@ -2083,6 +2083,7 @@ def test_tui_s_shows_the_issues_outside_the_sprint_dimmed_and_the_status_line_co
             await pilot.press("v", "slash", *"next up")  # a search finds them with s off
             await pilot.pause()
             assert list(keys()) == ["acme/infra#14"]
+            assert "1 of 9 issues" in str(app.query_one("#status").content)  # what a search reaches is what it counts against
 
     asyncio.run(scenario())
 
