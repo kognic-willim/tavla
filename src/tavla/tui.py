@@ -89,12 +89,27 @@ def pr_chip(prs: list[dict]) -> str:
     return f"[{color}]⎇ {plural(len(prs), 'PR')}{detail}[/]"
 
 
+def has_sprints() -> bool:
+    return any(p.get("sprint") for p in core.PROJECTS)
+
+
+def sprint_chip(card: dict) -> str:
+    """The sprint of a card not in the current sprint, in the warning colour where something is off: a leftover, or started work with no sprint."""
+    sprint = card.get("sprint")
+    if not sprint or sprint["state"] == "current":
+        return ""
+    started = card["statusColumn"] in ("progress", "blocked", "done")
+    warn = sprint["state"] == "leftover" or (sprint["state"] == "none" and started)
+    return f"[{'$warning' if warn else '$text-muted'}]{escape(sprint['title'] or 'no sprint')}[/]"
+
+
 def card_meta(card: dict, grouping: str) -> str:
     sub = card.get("subIssues") or {}
     parts = [
         session_chip(card),
         pr_chip(card.get("prs") or []),
         f"☑ {sub['completed']}/{sub['total']}" if sub.get("total") else "",
+        sprint_chip(card),
         f"[$text-muted]{escape(card['status'])}[/]" if grouping == "session" and card["status"] else "",
         "[$text-muted]⊘ hidden[/]" if card.get("hidden") else "",
     ]
@@ -225,8 +240,13 @@ class CardItem(ListItem):
             rows.append(Label(meta, classes="card-meta"))
         if labels := labels_line(card):
             rows.append(Label(labels, classes="card-labels"))
-        classes = ["card"] + ["has-session"] * bool(card["sessions"]) + ["is-hidden"] * bool(card.get("hidden")) + ["is-backlog"] * is_backlog(card, grouping)
+        classes = ["card"] + ["has-session"] * bool(card["sessions"]) + dimmed(card) + ["is-backlog"] * is_backlog(card, grouping)
         super().__init__(*rows, classes=" ".join(classes))
+
+
+def dimmed(card: dict) -> list[str]:
+    """The classes that dim a card shown although it is off the board: hidden (H), or outside the sprint (s)."""
+    return ["is-hidden"] * bool(card.get("hidden")) + ["is-outside"] * bool(card.get("sprintFiltered"))
 
 
 class SessItem(ListItem):
@@ -295,13 +315,14 @@ class CardRow(ListItem):
                 Label(escape(card["title"]), classes="c-title"),
                 IssueLink(ref, url=card["url"], tooltip="Open on GitHub", classes="c-ref"),
                 Label(escape(row_status(card, grouping, group_title)), classes="c-status"),
+                *([Label(sprint_chip(card), classes="c-sprint")] if has_sprints() else []),
                 Label(session_chip(card), classes="c-sessions"),
                 Label(pr_chip(card.get("prs") or []), classes="c-prs"),
                 Label(f"☑ {sub['completed']}/{sub['total']}" if sub.get("total") else "", classes="c-sub"),
                 Label("" if grouping == "parent" else parent_chip(card), classes="c-parent"),
                 Label(labels_line(card), classes="c-labels"),
             ),
-            classes=" ".join(["row"] + ["is-hidden"] * bool(card.get("hidden")) + ["is-backlog"] * is_backlog(card, grouping)),
+            classes=" ".join(["row"] + dimmed(card) + ["is-backlog"] * is_backlog(card, grouping)),
         )
 
 
@@ -317,6 +338,7 @@ class SessRow(ListItem):
                 Label(escape(sess["name"]), classes="c-title"),
                 Label(sess["id"], classes="c-ref"),
                 Label(f"{core.ago(sess['updatedAt'])} ago", classes="c-status"),
+                *([Label("", classes="c-sprint")] if has_sprints() else []),
                 Label(f"[{SESSION_COLOR[kind]}]{escape(sess['state'])}[/]", classes="c-sessions"),
                 Label("", classes="c-prs"),
                 Label("", classes="c-sub"),
@@ -398,6 +420,14 @@ class GroupedList(CardList):
 
 LIST_HEADER = ["", "Issue", "Repo", "Status", "Sessions", "PRs", "Sub", "Parent", "Labels"]
 LIST_CELLS = ["c-icon", "c-title", "c-ref", "c-status", "c-sessions", "c-prs", "c-sub", "c-parent", "c-labels"]
+
+
+def list_head() -> list[tuple[str, str]]:
+    """The list's column titles and cells; the Sprint cell only once a project names its sprint field."""
+    head = list(zip(LIST_HEADER, LIST_CELLS))
+    return [*head[:4], ("Sprint", "c-sprint"), *head[4:]] if has_sprints() else head
+
+
 SESS_HEADER = ["State", "Session", "Updated", "Id", "PRs", "Result"]
 SESS_CELLS = ["s-state", "s-name", "s-ago", "s-id", "s-prs", "s-result"]
 
@@ -588,7 +618,7 @@ class StopOrDelete(ModalScreen[str | None]):
         self.dismiss(None)
 
 
-BOARD_ACTIONS = {"search", "attach", "new", "new_unlinked", "new_issue", "open", "link", "unlink", "stop_delete", "hide", "show_hidden", "group", "view", "parent", "refresh", "back"}
+BOARD_ACTIONS = {"search", "attach", "new", "new_unlinked", "new_issue", "open", "link", "unlink", "stop_delete", "hide", "show_hidden", "show_outside", "group", "view", "parent", "refresh", "back"}
 
 
 CARD_CSS = """
@@ -629,7 +659,7 @@ class BoardApp(App):
     .card-ref Link:hover {{ color: $accent; text-style: underline; }}
     .card-parent {{ width: 1fr; height: 1; text-wrap: nowrap; text-overflow: ellipsis; }}
     .card-meta, .card-labels, .card-body {{ width: 1fr; margin-top: 1; }}
-    ListView.cards > ListItem.is-hidden {{ text-opacity: 50%; }}
+    ListView.cards > ListItem.is-hidden, ListView.cards > ListItem.is-outside {{ text-opacity: 50%; }}
     ListView.cards > ListItem.divider {{ height: 1; padding: 0 1; margin-bottom: 1; background: transparent; }}
     .col.list ListView.cards > ListItem.divider {{ margin-bottom: 0; }}
     .divider Horizontal {{ height: 1; }}
@@ -660,6 +690,7 @@ class BoardApp(App):
     .row Link.c-ref {{ color: $text-muted; text-style: none; }}
     .row Link.c-ref:hover {{ color: $accent; text-style: underline; }}
     .c-status {{ width: 11; }}
+    .c-sprint {{ width: 10; }}
     .row .c-ref, .row .c-status, .row .muted {{ color: $text-muted; }}
     .c-sessions {{ width: 24; }}
     .c-prs {{ width: 16; }}
@@ -701,6 +732,7 @@ class BoardApp(App):
         Binding("ctrl+x", "stop_delete", "Stop/delete", show=False),
         Binding("h", "hide", "Hide/unhide"),
         Binding("H", "show_hidden", "Show hidden", show=False),
+        Binding("s", "show_outside", "Show outside the sprint", show=False),
         Binding("g", "group", "Grouping"),
         Binding("v", "view", "View"),
         Binding("1", "parent(1)", "Parent", key_display="1-9"),
@@ -718,7 +750,8 @@ class BoardApp(App):
         self.parent_filter: str | None = None  # the key of the parent issue picked with 1-9
         self.hidden = core.load_hidden()  # issue keys hidden from the board, kept in hidden.json
         self.show_hidden = False
-        self.data: dict = {"cards": [], "unlinked": [], "fetchedAt": 0, "errors": []}
+        self.show_outside = False  # issues outside the sprint, shown with s
+        self.data: dict = {"cards": [], "unlinked": [], "sprints": [], "fetchedAt": 0, "errors": []}
         self.current: dict | None = None  # the highlighted card or unlinked session
         self.selection_list: ListView | None = None  # the board list current was picked in
         self.loading = False
@@ -804,14 +837,30 @@ class BoardApp(App):
         if self.parent_filter:
             title = next(c["parent"]["title"] for c in d["cards"] if (c.get("parent") or {}).get("key") == self.parent_filter)
             group += f"  ·  parent [{parent_color(self.parent_filter)}]{parent_number(self.parent_filter)} {escape(fit(title, 40))}[/]"
+        # Issues outside the sprint count nowhere while s leaves them out.
+        cards = [c for c in d["cards"] if self.show_outside or not c.get("sprintFiltered")]
         if self.filter or self.parent_filter:
             shown = sum(1 for c in self.visible(d["cards"]) if self.show_hidden or c["key"] not in self.hidden)
             text = f"filter [$accent]{escape(self.filter)}[/]: " if self.filter else ""
-            group += f"  ·  {text}{shown} of {plural(len(d['cards']), 'issue')}"
-        if n_hidden := sum(1 for c in d["cards"] if c["key"] in self.hidden):
+            group += f"  ·  {text}{shown} of {plural(len(cards), 'issue')}"
+        if n_hidden := sum(1 for c in cards if c["key"] in self.hidden):
             group += f"  ·  {n_hidden} hidden ({'shown, ' if self.show_hidden else ''}H toggles)"
+        group += self.sprint_status()
         errors = f"  ·  [$error]{len(d['errors'])} error(s): {escape(fit(d['errors'][0], 90))}[/]" if d["errors"] else ""
         self.query_one("#status", Static).update(f"{group}  ·  {state}{errors}")
+
+    def sprint_status(self) -> str:
+        """The first sprint project's current sprint, its days left, and how many issues are outside the sprint."""
+        sprints = self.data.get("sprints") or []
+        outside = sum(1 for c in self.data["cards"] if c.get("sprintFiltered"))
+        if not sprints and not outside:
+            return ""
+        parts = []
+        if sprints:
+            s = sprints[0]
+            parts += [escape(s["title"]), f"{plural(s['daysLeft'], 'day')} left" if s["daysLeft"] > 0 else "ended"]
+        parts.append(f"{outside} outside" + (" (shown, s toggles)" if self.show_outside else ""))
+        return "  ·  " + " · ".join(parts)
 
     # --- layout ----------------------------------------------------------------
 
@@ -823,7 +872,7 @@ class BoardApp(App):
         await box.remove_children()
         self.signatures = {k: v for k, v in self.signatures.items() if k == "sessions"}
         if self.view == "list":
-            head = Horizontal(*(Label(t, classes=c) for t, c in zip(LIST_HEADER, LIST_CELLS)), classes="list-head")
+            head = Horizontal(*(Label(t, classes=c) for t, c in list_head()), classes="list-head")
             await box.mount(Vertical(head, GroupedList(id="col-list", classes="cards"), classes="col list"))
         else:
             await box.mount_all(
@@ -869,7 +918,10 @@ class BoardApp(App):
         """The rows to draw: a filter also reaches the search-only cards (finished issues that left the board).
 
         A parent picked with 1-9 leaves only that issue and its sub-issues, so no unlinked session."""
-        rows = [r for r in rows if core.matches(r, self.filter)] if self.filter else [r for r in rows if not r.get("searchOnly")]
+        if self.filter:
+            rows = [r for r in rows if core.matches(r, self.filter)]
+        else:
+            rows = [r for r in rows if not r.get("searchOnly") or (self.show_outside and r.get("sprintFiltered"))]
         if self.parent_filter:
             rows = [r for r in rows if "sessions" in r and self.parent_filter in (r["key"], (r.get("parent") or {}).get("key"))]
         return rows
@@ -1154,11 +1206,18 @@ class BoardApp(App):
         self.show_hidden = not self.show_hidden
         await self.refill_hidden()
 
+    async def action_show_outside(self) -> None:
+        if not has_sprints():
+            self.notify(f'No sprint project: add sprint = "<iteration field>" to a [[projects]] entry in {core.CONFIG / "config.toml"}.', severity="warning", timeout=10)
+            return
+        self.show_outside = not self.show_outside
+        await self.refill_hidden()
+
     async def refill_hidden(self) -> None:
         await self.fill_columns()
-        # A card that just went hidden left its list: follow the highlight to the row that took its place.
+        # A card that just went hidden (or out with s) left its list: follow the highlight to the row that took its place.
         lv = self.focused
-        if not self.show_hidden and self.current and self.current.get("key") in self.hidden and isinstance(lv, ListView) and lv.id != "sessions":
+        if self.current and "sessions" in self.current and isinstance(lv, ListView) and lv.id != "sessions" and not any(self.item_key(it) == self.current_key() for it in lv.children):
             self.current, self.selection_list = self.payload(lv.highlighted_child), lv
             await self.show_detail()
         self.update_status()
