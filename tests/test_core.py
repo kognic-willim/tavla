@@ -2080,7 +2080,21 @@ def test_tui_s_shows_the_issues_outside_the_sprint_dimmed_and_the_status_line_co
             await pilot.pause()
             assert "acme/infra#14" not in [r.card["key"] for r in app.query(tui.CardRow)]
 
-            await pilot.press("v", "slash", *"next up")  # a search finds them with s off
+            # A toggle keeps a selection that is still on the board, even with the focus in another column.
+            await pilot.press("v")
+            await pilot.pause()
+            blocked = app.query_one("#col-blocked")
+            blocked.focus()
+            blocked.index = 0
+            await pilot.pause()
+            app.query_one("#col-progress").focus()
+            await pilot.press("s")
+            await pilot.pause()
+            assert app.current["key"] == "acme/infra#7"
+            await pilot.press("s")
+            await pilot.pause()
+
+            await pilot.press("slash", *"next up")  # a search finds them with s off
             await pilot.pause()
             assert list(keys()) == ["acme/infra#14"]
             assert "1 of 9 issues" in str(app.query_one("#status").content)  # what a search reaches is what it counts against
