@@ -152,6 +152,7 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setattr(core, "SESSION_CWD", tmp_path)
     monkeypatch.setattr(core, "THEME", "tavla")
     monkeypatch.setattr(core, "TERMINAL", "iterm2")
+    monkeypatch.setattr(core, "UNLINKED_DAYS", 10)
     monkeypatch.setattr(core, "run", fake_run)
     monkeypatch.setattr(core, "graphql", fake_graphql)
     GRAPHQL_CALLS.clear()
@@ -1523,6 +1524,22 @@ def test_config_file_sets_projects_issue_repos_session_dir_and_theme(monkeypatch
     assert core.PROJECTS == [{"owner": "octo", "number": "4", "is_backlog": True}, {"owner": "octo-org", "number": "9", "is_backlog": False}]
     assert core.ISSUE_REPOS == [("octo/todo", "Mine"), ("octo-org/tracker", "octo-org/tracker")]
     assert core.SESSION_CWD == core.Path.home() / "somewhere" and core.THEME == "nord"
+
+
+def test_finished_unlinked_sessions_stay_listed_for_the_configured_number_of_days():
+    def age(days):
+        st = {**JOBS["cccc3333"], "updatedAt": (datetime.now(UTC) - timedelta(days=days)).isoformat()}
+        (core.JOBS / "cccc3333" / "state.json").write_text(json.dumps(st))
+        return [s["id"] for s in core.build_board()["unlinked"]]
+
+    assert age(9) == ["cccc3333"] and age(11) == []  # 10 days without a config file
+    core.CONFIG.mkdir(parents=True, exist_ok=True)
+    (core.CONFIG / "config.toml").write_text("unlinked_days = 0.5\n")
+    core.load_config()
+    assert age(0.4) == ["cccc3333"] and age(1) == []
+    (core.CONFIG / "config.toml").write_text('unlinked_days = "soon"\n')
+    with pytest.raises(ValueError, match="unlinked_days must be a number of days"):
+        core.load_config()
 
 
 def test_config_file_with_a_broken_entry_is_reported_with_its_path(capsys):

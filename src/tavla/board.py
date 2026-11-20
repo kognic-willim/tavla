@@ -23,7 +23,7 @@ JOBS = Path.home() / ".claude" / "jobs"
 TRANSCRIPTS = Path.home() / ".claude" / "projects"
 # Local state and config.toml.
 CONFIG = Path(os.environ.get("TAVLA_HOME", Path.home() / ".config" / "tavla"))
-# The four below are set from config.toml by load_config().
+# The ones below are set from config.toml by load_config().
 # Projects whose Status field places a card, in precedence order. Non-Done items of a
 # backlog project become cards even when no session or assignment points at them.
 PROJECTS: list[dict] = []
@@ -35,6 +35,8 @@ THEME = "tavla"
 # The terminal app `attach` opens tabs in.
 TERMINALS = {"iterm2": "iTerm2", "ghostty": "Ghostty"}
 TERMINAL = "ghostty" if os.environ.get("TERM_PROGRAM") == "ghostty" else "iterm2"
+# How long a finished session on no card stays listed under Unlinked.
+UNLINKED_DAYS: float = 10
 PROJECT_TTL_S = 300
 ASSIGNED_TTL_S = 300  # open issues assigned to me
 META_TTL_S = 600  # issue/PR metadata: labels, sub-issues, linked PRs, open state
@@ -86,8 +88,8 @@ Ref = tuple[str, str, int]
 
 
 def load_config() -> None:
-    """Set PROJECTS, ISSUE_REPOS, SESSION_CWD, THEME and TERMINAL from CONFIG/config.toml; a missing file leaves the defaults."""
-    global PROJECTS, ISSUE_REPOS, SESSION_CWD, THEME, TERMINAL
+    """Set PROJECTS, ISSUE_REPOS, SESSION_CWD, THEME, TERMINAL and UNLINKED_DAYS from CONFIG/config.toml; a missing file leaves the defaults."""
+    global PROJECTS, ISSUE_REPOS, SESSION_CWD, THEME, TERMINAL, UNLINKED_DAYS
     path = CONFIG / "config.toml"
     try:
         cfg = tomllib.loads(path.read_text())
@@ -106,7 +108,10 @@ def load_config() -> None:
     terminal = str(cfg.get("terminal") or TERMINAL).lower()
     if terminal not in TERMINALS:
         raise ValueError(f"{path}: terminal must be one of {', '.join(TERMINALS)}, got {terminal!r}")
-    PROJECTS, ISSUE_REPOS, TERMINAL = projects, repos, terminal
+    days = cfg.get("unlinked_days", UNLINKED_DAYS)
+    if isinstance(days, bool) or not isinstance(days, (int, float)) or days < 0:
+        raise ValueError(f"{path}: unlinked_days must be a number of days, 0 or more, got {days!r}")
+    PROJECTS, ISSUE_REPOS, TERMINAL, UNLINKED_DAYS = projects, repos, terminal, days
     if cfg.get("session_dir"):
         SESSION_CWD = Path(str(cfg["session_dir"])).expanduser()
     THEME = str(cfg.get("theme") or THEME)
@@ -807,8 +812,9 @@ def _build_board(force: bool, offline: bool) -> dict:
     cards.sort(key=lambda c: (liveness.get(c["sessionColumn"], 2), -c["updatedAt"]))
     # Unlinked means on no card: no issue found, or its issue has no card (e.g. GitHub couldn't be asked).
     on_card = {c["key"] for c in cards}
+    unlinked_since = now_ms() - UNLINKED_DAYS * 86_400_000
     unlinked = sorted(
-        (s for s in sessions if not on_card.intersection(s["issues"]) and (s["kind"] != "idle" or s["updatedAt"] >= recent)),
+        (s for s in sessions if not on_card.intersection(s["issues"]) and (s["kind"] != "idle" or s["updatedAt"] >= unlinked_since)),
         key=lambda s: -s["updatedAt"],
     )
     return {"cards": cards, "unlinked": unlinked, "fetchedAt": now_ms(), "errors": errors, "isOffline": False}
