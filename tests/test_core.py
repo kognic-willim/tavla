@@ -93,7 +93,8 @@ def fake_graphql(query, variables=None):
         STATUS_SETS.append(variables)
         return {"data": {"updateProjectV2ItemFieldValue": {"projectV2Item": {"id": variables["item"]}}}}
     if 'field(name: "Status")' in query:
-        options = [{"id": "opt-todo", "name": "Todo"}, {"id": "opt-progress", "name": "In progress"}]
+        options = [{"id": "opt-todo", "name": "Todo"}, {"id": "opt-progress", "name": "In progress"}, {"id": "opt-blocked", "name": "Blocked"}, {"id": "opt-done", "name": "Done"}]
+        GRAPHQL_CALLS.append(f"status field {variables['owner']}")
         return {"data": {"repositoryOwner": {"projectV2": {"id": f"PVT_{variables['owner']}", "field": {"id": "PVTSSF_status", "options": options}}}}}
     if "closedAt" in query and "projectV2" in query:
         GRAPHQL_CALLS.append(f"closed project {variables['owner']}")
@@ -153,6 +154,7 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setattr(core, "THEME", "tavla")
     monkeypatch.setattr(core, "TERMINAL", "iterm2")
     monkeypatch.setattr(core, "UNLINKED_DAYS", 10)
+    monkeypatch.setattr(core, "STATUS_FIELDS", {})
     monkeypatch.setattr(core, "run", fake_run)
     monkeypatch.setattr(core, "graphql", fake_graphql)
     GRAPHQL_CALLS.clear()
@@ -826,6 +828,84 @@ def test_start_progress_moves_a_todo_card_on_its_own_project_and_the_next_refres
     card = next(c for c in core.build_board()["cards"] if c["key"] == "acme/infra#11")
     assert (card["status"], card["statusColumn"]) == ("In progress", "progress")
     assert not any(c.startswith("project") for c in GRAPHQL_CALLS)  # from the patched cache
+
+
+def test_set_status_moves_a_card_to_any_status_of_its_project_and_reads_the_options_once():
+    cards = {c["key"]: c for c in core.build_board()["cards"]}
+    GRAPHQL_CALLS.clear()
+    assert core.set_status(cards["acme/infra#7"], "done") == "Done"  # the name is matched ignoring case
+    assert core.set_status(cards["acme/infra#7"], "Todo") == "Todo"
+    assert STATUS_SETS == [{"project": "PVT_team", "item": "PVTI_7", "field": "PVTSSF_status", "option": o} for o in ("opt-done", "opt-todo")]
+    assert GRAPHQL_CALLS == ["status field team"]
+    card = next(c for c in core.build_board()["cards"] if c["key"] == "acme/infra#7")
+    assert (card["status"], card["statusColumn"]) == ("Todo", "todo")
+    with pytest.raises(RuntimeError, match="has no Status option Parked"):
+        core.set_status(card, "Parked")
+    with pytest.raises(RuntimeError, match="acme/infra#9 is on none of the configured projects"):
+        core.set_status(cards["acme/infra#9"], "Done")
+
+
+def test_an_issue_with_no_status_takes_one_on_the_first_project_it_is_on(monkeypatch):
+    monkeypatch.setitem(PROJECTS, "me", [item("acme/infra", 11, "Personal todo", None)])
+    monkeypatch.setitem(PROJECTS, "team", [item("acme/infra", 11, "Personal todo", None)])
+    card = next(c for c in core.build_board()["cards"] if c["key"] == "acme/infra#11")
+    assert (card["status"], card["statusItem"]) == ("", {"project": "me/1", "itemId": "PVTI_11"})
+    # A project that does give it a status wins over an earlier one that gives none.
+    monkeypatch.setitem(PROJECTS, "team", [item("acme/infra", 11, "Personal todo", "Blocked")])
+    card = next(c for c in core.build_board(force=True)["cards"] if c["key"] == "acme/infra#11")
+    assert (card["status"], card["statusItem"]) == ("Blocked", {"project": "team/23", "itemId": "PVTI_11"})
+
+
+def test_tui_u_lists_the_project_statuses_and_a_number_or_enter_sets_one(monkeypatch):
+    from tavla import tui
+
+    async def scenario():
+        app = tui.BoardApp()
+        async with app.run_test(size=(190, 45)) as pilot:
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+
+            async def press_u(column, key):
+                col = app.query_one(f"#col-{column}")
+                col.focus()
+                col.index = next(i for i, it in enumerate(col.children) if getattr(it, "card", {}).get("key") == key)
+                await pilot.pause()
+                await pilot.press("u")
+                await app.workers.wait_for_complete()
+                await pilot.pause()
+
+            await press_u("todo", "acme/infra#11")
+            assert isinstance(app.screen, tui.PickStatus)
+            options = app.screen.query_one("#statuses", tui.OptionList)
+            assert [str(o.prompt).split("  ")[1] for o in options.options] == ["Todo", "In progress", "Blocked", "Done"]
+            assert options.highlighted == 0 and "current" in str(options.options[0].prompt)
+            await pilot.press("3")
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            assert not isinstance(app.screen, tui.PickStatus)
+            assert STATUS_SETS == [{"project": "PVT_me", "item": "PVTI_11", "field": "PVTSSF_status", "option": "opt-blocked"}]
+            assert "acme/infra#11" in [it.card["key"] for it in app.query_one("#col-blocked").children]
+
+            await press_u("blocked", "acme/infra#11")
+            assert app.screen.query_one("#statuses", tui.OptionList).highlighted == 2
+            await pilot.press("up", "enter")
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            assert STATUS_SETS[-1]["option"] == "opt-progress" and len(STATUS_SETS) == 2
+
+            await press_u("progress", "acme/infra#11")
+            await pilot.press("enter")  # the current status: nothing to set
+            await app.workers.wait_for_complete()
+            await press_u("progress", "acme/infra#11")
+            await pilot.press("escape")
+            await app.workers.wait_for_complete()
+            assert not isinstance(app.screen, tui.PickStatus) and len(STATUS_SETS) == 2
+
+            await press_u("todo", "acme/infra#9")  # assigned, on no project
+            assert not isinstance(app.screen, tui.PickStatus)
+            assert any("acme/infra#9 is on none of the projects" in str(n.message) for n in app._notifications)
+
+    asyncio.run(scenario())
 
 
 def test_tui_new_session_offers_in_progress_only_on_todo_cards(monkeypatch):

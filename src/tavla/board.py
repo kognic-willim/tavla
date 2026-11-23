@@ -73,6 +73,8 @@ RECENT_S = 3 * 86_400
 NEEDS = {"blocked", "needs_input", "needs-input", "waiting", "review"}
 WORKING = {"working", "running", "starting", "busy"}
 STATUS_COLUMNS = [("todo", "Todo"), ("progress", "In Progress"), ("blocked", "Blocked"), ("done", "Done")]
+# Each project's Status field (project id, field id, options), read once per run: the options hardly ever change.
+STATUS_FIELDS: dict[str, dict] = {}
 # Not-started statuses share the Todo column; a card keeps its own status for display.
 # Statuses a new session may move to In Progress.
 NOT_STARTED = ("Todo", "Backlog")
@@ -732,12 +734,15 @@ def _build_board(force: bool, offline: bool) -> dict:
     for i in assigned:
         add_issue(f"{i['repository']['nameWithOwner']}#{i['number']}".lower(), i["title"], i["url"], True, parse_time_ms(i.get("updatedAt")), True)
     status_of: dict[str, str] = {}
-    status_item: dict[str, dict] = {}  # the project item that status came from, for start_progress
+    status_item: dict[str, dict] = {}  # the project item that status came from, for set_status
+    unset_item: dict[str, dict] = {}  # with no status on any project, the first project the issue is on
     for it in project_items:
         if it["status"] and it["key"] not in status_of:
             status_of[it["key"]] = it["status"]
             if it.get("itemId"):
                 status_item[it["key"]] = {"project": it["project"], "itemId": it["itemId"]}
+        elif not it["status"] and it.get("itemId"):
+            unset_item.setdefault(it["key"], {"project": it["project"], "itemId": it["itemId"]})
         if it["isBacklog"] and it["status"] != "Done":
             add_issue(it["key"], it["title"], it["url"], True, 0, True)
 
@@ -794,7 +799,7 @@ def _build_board(force: bool, offline: bool) -> dict:
                 "isOpen": iss["isOpen"],
                 "status": status if iss["isOpen"] else "Closed",
                 "statusColumn": status_column,
-                "statusItem": status_item.get(key),
+                "statusItem": status_item.get(key) or unset_item.get(key),
                 "sessionColumn": session_column,
                 "searchOnly": search_only,
                 "updatedAt": max(iss["updatedAt"], last_touch),
@@ -1016,22 +1021,33 @@ def create_issue(repo: str, title: str, body: str = "", assign: bool = True) -> 
     return {"key": key_of((m[1], m[2], int(m[3]))), "url": url, "title": issue["title"]}
 
 
-def start_progress(card: dict) -> bool:
-    """Move a card whose status is Todo or Backlog to In Progress, on the project its status came from.
+def status_field(project: str) -> dict:
+    """The Status field of a project (owner/number): the project's id, the field's id and its options."""
+    if project not in STATUS_FIELDS:
+        owner, number = project.split("/")
+        proj = ((graphql(STATUS_FIELD_QUERY, {"owner": owner, "number": int(number)}).get("data") or {}).get("repositoryOwner") or {}).get("projectV2") or {}
+        field = proj.get("field") or {}
+        if not proj.get("id") or not field.get("id") or not field.get("options"):
+            raise RuntimeError(f"project {project} has no Status field")
+        STATUS_FIELDS[project] = {"project": proj["id"], "field": field["id"], "options": field["options"]}
+    return STATUS_FIELDS[project]
 
-    False when there is nothing to move: another status, or no project item recorded for it. The
-    cached project list is patched, so the next refresh shows the move without refetching."""
+
+def set_status(card: dict, name: str) -> str:
+    """Set a card's status, on the project its status came from, to the option of that name (case ignored).
+
+    Returns the option's own name. The cached project list is patched, so the next refresh shows
+    the change without refetching."""
     item = card.get("statusItem")
-    if card.get("status") not in NOT_STARTED or not item:
-        return False
-    owner, number = item["project"].split("/")
-    proj = ((graphql(STATUS_FIELD_QUERY, {"owner": owner, "number": int(number)}).get("data") or {}).get("repositoryOwner") or {}).get("projectV2") or {}
-    field = proj.get("field") or {}
-    option = next((o for o in field.get("options") or [] if o["name"].lower() == "in progress"), None)
-    if not proj.get("id") or not field.get("id") or not option:
-        raise RuntimeError(f"project {item['project']} has no Status option In Progress")
-    body = graphql(SET_STATUS_MUTATION, {"project": proj["id"], "item": item["itemId"], "field": field["id"], "option": option["id"]})
+    if not item:
+        raise RuntimeError(f"{card['key']} is on none of the configured projects")
+    field = status_field(item["project"])
+    option = next((o for o in field["options"] if o["name"].lower() == name.lower()), None)
+    if not option:
+        raise RuntimeError(f"project {item['project']} has no Status option {name}")
+    body = graphql(SET_STATUS_MUTATION, {"project": field["project"], "item": item["itemId"], "field": field["field"], "option": option["id"]})
     if not ((body.get("data") or {}).get("updateProjectV2ItemFieldValue") or {}).get("projectV2Item"):
+        STATUS_FIELDS.pop(item["project"], None)  # the options may have changed since they were read
         raise RuntimeError(f"status not changed: {(body.get('errors') or [{}])[0].get('message', 'no answer')}")
     try:
         cached = json.loads((CONFIG / "projects-cache.json").read_text())
@@ -1041,6 +1057,16 @@ def start_progress(card: dict) -> bool:
         (CONFIG / "projects-cache.json").write_text(json.dumps(cached))
     except OSError, json.JSONDecodeError, KeyError, TypeError:
         pass  # no cache: the next refresh fetches the projects anyway
+    return option["name"]
+
+
+def start_progress(card: dict) -> bool:
+    """Move a card whose status is Todo or Backlog to In Progress, on the project its status came from.
+
+    False when there is nothing to move: another status, or no project item recorded for it."""
+    if card.get("status") not in NOT_STARTED or not card.get("statusItem"):
+        return False
+    set_status(card, "In Progress")
     return True
 
 
