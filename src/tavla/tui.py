@@ -1153,8 +1153,9 @@ class BoardApp(App):
             self.call_from_thread(self.notify, f"{sess['name']} is interactive and already runs in its own terminal.", severity="warning")
             return
         try:
-            core.attach(sess["id"], sess["name"], cwd=sess.get("cwd") or "")
-            self.call_from_thread(self.notify, f"Attached {sess['id']} in a new {core.TERMINALS[core.TERMINAL]} tab")
+            opened = core.attach(sess["id"], sess["name"], cwd=sess.get("cwd") or "")
+            where = "a new" if opened else "its existing"
+            self.call_from_thread(self.notify, f"Attached {sess['id']} in {where} {core.TERMINALS[core.TERMINAL]} tab")
         except Exception as err:  # noqa: BLE001
             self.call_from_thread(self.notify, f"Attach failed: {err}", severity="error")
 

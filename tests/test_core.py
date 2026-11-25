@@ -40,6 +40,8 @@ CLOSED = {"acme/infra#20", "acme/infra#31", "me/todo#5", "me/todo#4"}
 GRAPHQL_CALLS: list[str] = []
 STATUS_SETS: list[dict] = []
 RESUMED: list[dict] = []
+# Another session's attached tab, and a shell that only mentions the session: neither is a tab on aaaa1111.
+PS_OUTPUT = "ttys003  claude attach cccc3333\nttys004  grep claude attach aaaa1111\n??       claude --bg aaaa1111\n"
 
 
 def fake_run(argv, timeout=60, cwd=None):
@@ -68,6 +70,8 @@ def fake_run(argv, timeout=60, cwd=None):
         return f"backgrounded · {argv[-1][:8]} (idle — send a prompt to start)\n"
     if cmd.startswith("claude --bg"):
         return "Started background session dddd4444\n"
+    if cmd.startswith("ps "):
+        return PS_OUTPUT
     raise AssertionError(f"unexpected command: {cmd}")
 
 
@@ -433,11 +437,43 @@ def test_attach_opens_an_iterm_tab_in_the_session_directory(monkeypatch):
     assert osa[0] == "osascript" and 'tell application "iTerm2"' in osa[2]
     # The tail closes the tab once the session is deleted: its job directory is then gone.
     assert osa[3:] == [
-        f"printf '\\033]1;%s\\007' 'fix flaky deploy' && cd '/Users/me/Code/my repo' && CLAUDE_CODE_DISABLE_TERMINAL_TITLE=1 claude attach aaaa1111; [ -d {core.JOBS / 'aaaa1111'} ] || exit"
+        f"printf '\\033]1;%s\\007' 'fix flaky deploy' && cd '/Users/me/Code/my repo' && CLAUDE_CODE_DISABLE_TERMINAL_TITLE=1 claude attach aaaa1111; [ -d {core.JOBS / 'aaaa1111'} ] || exit",
+        "",  # no tab is attached to it yet
     ]
     # A session with no recorded directory starts where new sessions do.
     core.attach("bbbb2222", "chart bump")
     assert calls[-1][3] == f"printf '\\033]1;%s\\007' 'chart bump' && cd {core.SESSION_CWD} && CLAUDE_CODE_DISABLE_TERMINAL_TITLE=1 claude attach bbbb2222; [ -d {core.JOBS / 'bbbb2222'} ] || exit"
+
+
+def test_attach_switches_to_the_iterm_tab_already_attached_to_the_session(monkeypatch, capsys):
+    calls = []
+    ps = "ttys003  claude attach cccc3333\nttys007  /opt/homebrew/bin/claude attach aaaa1111\n"
+    monkeypatch.setattr(core, "run", lambda argv, timeout=60, cwd=None: calls.append(argv) or ("focused\n" if argv[0] == "osascript" else ps))
+    assert core.main(["attach", "aaaa1111"]) == 0
+    assert calls[-1][0] == "osascript" and calls[-1][4] == "/dev/ttys007"
+    assert capsys.readouterr().out.strip() == "switched to the tab already attached to aaaa1111"
+    # ps failing falls back to a new tab rather than failing the attach.
+    monkeypatch.setattr(core, "run", lambda argv, timeout=60, cwd=None: calls.append(argv) or ("opened\n" if argv[0] == "osascript" else (_ for _ in ()).throw(RuntimeError("ps: denied"))))
+    assert core.attach("aaaa1111", "fix flaky deploy").endswith("|| exit") and calls[-1][4] == ""
+
+
+def test_tui_says_when_attach_switched_to_an_existing_tab(monkeypatch):
+    from tavla import tui
+
+    monkeypatch.setattr(core, "attach", lambda sid, title="", dry_run=False, cwd="": "")
+    notes = []
+
+    async def go():
+        app = tui.BoardApp()
+        async with app.run_test(size=(160, 40)) as pilot:
+            await app.workers.wait_for_complete()
+            app.notify = lambda msg, **kw: notes.append(msg)
+            app.attach({"id": "aaaa1111", "name": "fix flaky deploy"})
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+
+    asyncio.run(go())
+    assert notes == ["Attached aaaa1111 in its existing iTerm2 tab"]
 
 
 def test_tui_draws_columns_and_attaches_selected_session(monkeypatch):

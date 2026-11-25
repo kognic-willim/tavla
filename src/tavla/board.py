@@ -913,11 +913,27 @@ def summary(board: dict, grouping: str) -> str:
 
 # --- actions -----------------------------------------------------------------
 
+# Given the tty of a tab already attached to the session, brings that tab forward instead of opening one.
 ITERM_SCRIPT = """
 on run argv
   set cmd to item 1 of argv
+  set ttyPath to item 2 of argv
   tell application "iTerm2"
     activate
+    if ttyPath is not "" then
+      repeat with w in windows
+        repeat with t in tabs of w
+          repeat with s in sessions of t
+            if tty of s is ttyPath then
+              select w
+              tell t to select
+              tell s to select
+              return "focused"
+            end if
+          end repeat
+        end repeat
+      end repeat
+    end if
     if (count of windows) = 0 then
       set s to current session of (create window with default profile)
     else
@@ -925,6 +941,7 @@ on run argv
       set s to current session of t
     end if
     tell s to write text cmd
+    return "opened"
   end tell
 end run
 """
@@ -948,8 +965,25 @@ end run
 """
 
 
+def attached_tty(session_id: str) -> str:
+    """The tty of a terminal running `claude attach <session_id>`, or "" when none does."""
+    try:
+        out = run(["ps", "-ax", "-o", "tty=,command="])
+    except RuntimeError:
+        return ""
+    for line in out.splitlines():
+        tty, _, command = line.strip().partition(" ")
+        argv = command.split()
+        if len(argv) == 3 and Path(argv[0]).name == "claude" and argv[1:] == ["attach", session_id] and tty.startswith("tty"):
+            return f"/dev/{tty}"
+    return ""
+
+
 def attach(session_id: str, title: str = "", dry_run: bool = False, cwd: str = "") -> str:
     """Open a new tab in TERMINAL attached to the session; detaching leaves the tab's shell open.
+
+    Returns the command the new tab runs, or "" when an iTerm2 tab already attached to the session
+    was brought forward instead: that tab is found by the tty its `claude attach` runs on.
 
     The tab closes itself once the session is deleted: `claude attach` returns when its session is
     removed, and the shell then exits because the job directory is gone.
@@ -961,10 +995,12 @@ def attach(session_id: str, title: str = "", dry_run: bool = False, cwd: str = "
     and gets the name as a tab name override instead."""
     name = shlex.quote(title or session_id)
     cmd = f"printf '\\033]1;%s\\007' {name} && cd {shlex.quote(cwd or str(SESSION_CWD))} && CLAUDE_CODE_DISABLE_TERMINAL_TITLE=1 claude attach {session_id}; [ -d {shlex.quote(str(JOBS / session_id))} ] || exit"
-    argv = ["osascript", "-e", GHOSTTY_SCRIPT, cmd, title or session_id] if TERMINAL == "ghostty" else ["osascript", "-e", ITERM_SCRIPT, cmd]
-    if not dry_run:
-        run(argv, timeout=20)
-    return cmd
+    if dry_run:
+        return cmd
+    if TERMINAL == "ghostty":
+        run(["osascript", "-e", GHOSTTY_SCRIPT, cmd, title or session_id], timeout=20)
+        return cmd
+    return "" if run(["osascript", "-e", ITERM_SCRIPT, cmd, attached_tty(session_id)], timeout=20).strip() == "focused" else cmd
 
 
 def new_session(target: str, prompt: str = "", title: str = "") -> str:
@@ -1206,7 +1242,7 @@ def main(argv: list[str] | None = None) -> int:
             s = resolve_session(a.session)
             if s["isInteractive"]:
                 raise ValueError(f"{s['id']} is an interactive session running in its own terminal; only background sessions attach")
-            print(attach(s["id"], s["name"], a.dry_run, s["cwd"]))
+            print(attach(s["id"], s["name"], a.dry_run, s["cwd"]) or f"switched to the tab already attached to {s['id']}")
         elif a.cmd == "new":
             print(new_session(a.issue, " ".join(a.prompt)))
         elif a.cmd == "start":
