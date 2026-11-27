@@ -576,6 +576,26 @@ def load_closed(force: bool, errors: list[str], offline: bool = False) -> list[d
     return items
 
 
+def load_viewer(errors: list[str], offline: bool = False) -> str:
+    """Your GitHub login, which tells your sub-issues from someone else's. Asked once and kept, since it doesn't
+    change; empty while it is not known (offline before the first answer)."""
+    cached, _ = read_cache("viewer-cache.json", float("inf"), False, offline)
+    if cached:
+        return str(cached[0])
+    if offline:
+        return ""
+    try:
+        login = ((graphql("{ viewer { login } }").get("data") or {}).get("viewer") or {}).get("login") or ""
+    except RateLimited:
+        raise
+    except Exception as err:  # noqa: BLE001
+        errors.append(f"viewer: {err}")
+        return ""
+    if login:
+        write_cache("viewer-cache.json", [login], errors)
+    return login
+
+
 def project_id(p: dict) -> str:
     return f"{p['owner']}/{p['number']}"
 
@@ -909,15 +929,17 @@ def _build_board(force: bool, offline: bool) -> dict:
     started = time.time()
     errors: list[str] = []
     links = load_links()
-    with ThreadPoolExecutor(4) as pool:
+    with ThreadPoolExecutor(5) as pool:
         f_sessions = pool.submit(read_sessions, links, errors)
         f_assigned = pool.submit(load_assigned, force, errors, offline)
         f_projects = pool.submit(load_projects, force, errors, offline)
         f_closed = pool.submit(load_closed, force, errors, offline)
+        f_viewer = pool.submit(load_viewer, errors, offline)
         raw = f_sessions.result()
         assigned = f_assigned.result()
         project_items, fields = f_projects.result()
         closed = f_closed.result()
+        viewer = f_viewer.result()
 
     # Sprint projects: those whose iteration field could be read. A misnamed field, or one never read, leaves its
     # project out of the sprint rule (fail open), so it can't hide the board.
@@ -1055,16 +1077,35 @@ def _build_board(force: bool, offline: bool) -> dict:
         if card["sessionColumn"] != "backlog" or iss["isMine"]:
             cards.append(card)
     attach_subtrees(cards, make_card, meta, errors, force, offline, started)
-    liveness = {"needs": 0, "working": 1}
-    cards.sort(key=lambda c: (liveness.get(c["sessionColumn"], 2), -c["updatedAt"]))
-    # Unlinked means on no card: no issue found, or its issue has no card (e.g. GitHub couldn't be asked).
-    on_card = {c["key"] for c in cards}
+    # Unlinked means on no card and in no card's subtree: no issue found, or its issue has no card (e.g. GitHub couldn't be asked).
+    on_card = set().union(*(subtree_keys(c) for c in cards))
+    # A card inside a board issue's subtree shows only there: the flat list holds the board issues and the search-only cards under none.
+    under_board = set().union(*(subtree_keys(c) - {c["key"]} for c in cards if c["isBoardIssue"]))
+    cards = [c for c in cards if c["key"] not in under_board]
+    cards.sort(key=board_order)
     unlinked_since = now_ms() - UNLINKED_DAYS * 86_400_000
     unlinked = sorted(
         (s for s in sessions if not on_card.intersection(s["issues"]) and (s["kind"] != "idle" or s["updatedAt"] >= unlinked_since)),
         key=lambda s: -s["updatedAt"],
     )
-    return {"cards": cards, "unlinked": unlinked, "sprints": sprints, "fetchedAt": now_ms(), "errors": errors, "isOffline": False}
+    return {"cards": cards, "unlinked": unlinked, "sprints": sprints, "viewer": viewer, "fetchedAt": now_ms(), "errors": errors, "isOffline": False}
+
+
+def subtree_keys(card: dict) -> set[str]:
+    """The keys of a card and of every issue in its subtree."""
+    keys: set[str] = set()
+    todo = [card]
+    while todo:
+        c = todo.pop()
+        if c["key"] not in keys:
+            keys.add(c["key"])
+            todo += c.get("subtree") or []
+    return keys
+
+
+def board_order(card: dict) -> tuple[int, int]:
+    """Cards needing you first, then working ones, then the most recently updated."""
+    return ({"needs": 0, "working": 1}.get(card["sessionColumn"], 2), -card["updatedAt"])
 
 
 def columns(grouping: str) -> list[tuple[str, str]]:
@@ -1083,40 +1124,9 @@ def column_cards(cards: list[dict], col_id: str, grouping: str) -> list[dict]:
     return members
 
 
-NO_PARENT = ("none", "No parent")
-
-
-def parent_groups(cards: list[dict]) -> list[dict]:
-    """The cards under their parent issue, in board order: {"id", "title", "parent", "cards"} per parent.
-
-    A card that is itself the parent of another card leads that group; cards with neither come last, under No parent."""
-    by_key = {c["key"]: c for c in cards}
-    heads = {c["parent"]["key"]: c["parent"] for c in cards if c.get("parent")}
-    groups: dict[str, dict] = {}
-    loose = []
-    for c in cards:
-        gid = c["parent"]["key"] if c.get("parent") else c["key"] if c["key"] in heads else None
-        if gid is None:
-            loose.append(c)
-            continue
-        group = groups.setdefault(gid, {"id": gid, "title": heads[gid]["title"], "parent": heads[gid], "cards": []})
-        group["cards"].append(c)
-    for gid, group in groups.items():
-        if gid in by_key:
-            group["cards"].sort(key=lambda c: c["key"] != gid)
-    return [*groups.values(), {"id": NO_PARENT[0], "title": NO_PARENT[1], "parent": None, "cards": loose}]
-
-
 def groups(cards: list[dict], grouping: str) -> list[dict]:
-    """Every group of a grouping with its cards: the fixed columns by status or session, one group per parent issue by parent."""
-    if grouping == "parent":
-        return parent_groups(cards)
-    return [{"id": col_id, "title": title, "parent": None, "cards": column_cards(cards, col_id, grouping)} for col_id, title in columns(grouping)]
-
-
-def parent_note(parent: dict) -> str:
-    sub = parent.get("subIssues") or {}
-    return parent["key"] + (f" {sub['completed']}/{sub['total']} done" if sub.get("total") else "")
+    """Every column of a grouping, by issue status or by session state, with its cards."""
+    return [{"id": col_id, "title": title, "cards": column_cards(cards, col_id, grouping)} for col_id, title in columns(grouping)]
 
 
 def badge(card: dict) -> str:
@@ -1134,9 +1144,9 @@ def ago(ms: int) -> str:
 
 
 def summary(board: dict, grouping: str) -> str:
-    """The board as text. By status or session it lists the board issues, each with its subtree indented beneath it."""
+    """The board as text: the board issues in their columns, each with its subtree indented beneath it."""
     lines = []
-    on_board = [c for c in board["cards"] if not c.get("searchOnly") and (grouping == "parent" or c.get("isBoardIssue", True))]
+    on_board = [c for c in board["cards"] if not c.get("searchOnly")]
 
     def sessions(card: dict, depth: int) -> list[str]:
         return [f'{"  " * depth}- {s["id"]} {s["state"]} "{s["name"]}" {ago(s["updatedAt"])}' for s in card["sessions"]]
@@ -1150,16 +1160,12 @@ def summary(board: dict, grouping: str) -> str:
 
     for group in groups(on_board, grouping):
         cs = group["cards"]
-        if grouping == "parent" and not cs:
-            continue
-        note = f" [{parent_note(group['parent'])}]" if group["parent"] else ""
-        lines.append(f"## {group['title']} ({len(cs)}){note}")
+        lines.append(f"## {group['title']} ({len(cs)})")
         for c in cs:
             tag = badge(c) if grouping == "status" else c["status"]
             lines.append(f"- {c['key']} {c['title']}" + (f" [{tag}]" if tag else ""))
             lines += sessions(c, 1)
-            if grouping != "parent":
-                lines += subtree(c, 1)
+            lines += subtree(c, 1)
     lines.append(f"## Unlinked sessions ({len(board['unlinked'])})")
     lines += [f'- {s["id"]} {s["state"]} "{s["name"]}" {ago(s["updatedAt"])}' for s in board["unlinked"]]
     if board["errors"]:
@@ -1551,7 +1557,7 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("json", help="print the board as JSON")
     p.add_argument("--force", action="store_true", help="bypass the project status cache")
     p = sub.add_parser("dump", help="print the board as text")
-    p.add_argument("--group", choices=["status", "session", "parent"], default="status")
+    p.add_argument("--group", choices=["status", "session"], default="status")
     p.add_argument("--force", action="store_true")
     p = sub.add_parser("attach", help="attach to a session in a new terminal tab")
     p.add_argument("session")

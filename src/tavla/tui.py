@@ -8,7 +8,6 @@ import shlex
 import subprocess
 import sys
 import tempfile
-import zlib
 from contextlib import suppress
 from pathlib import Path
 from typing import ClassVar
@@ -29,12 +28,10 @@ REFRESH_S = 60
 COL_MIN = 36  # five board columns at this width fit a 190-wide terminal
 GLYPH = {"needs": "●", "working": "◐", "idle": "○"}
 SESSION_COLOR = {"needs": "$warning", "working": "$accent", "idle": "$text-muted"}
-GROUPINGS = {"status": "issue status", "session": "session state", "parent": "parent issue"}
-# tavla's own colours, one set for dark themes and one for light: "merged" is a merged PR and a closed issue's check mark,
-# "parents" one per parent issue on the board (past eight parents, colours are shared). Slot n means the same parent in both.
-PARENT_SLOTS = 8
-DARK = {"merged": "#a371f7", "parents": ["#6cb6ff", "#f69d50", "#dcbdfb", "#57c4b8", "#f47067", "#c6d05a", "#e275ad", "#96a8f8"]}
-LIGHT = {"merged": "#6c71c4", "parents": ["#268bd2", "#cb4b16", "#6c71c4", "#2aa198", "#dc322f", "#b58900", "#d33682", "#859900"]}  # the Solarized accents
+GROUPINGS = {"status": "issue status", "session": "session state"}
+# tavla's own colours, one set for dark themes and one for light: "merged" is a merged PR and a closed issue's check mark.
+DARK = {"merged": "#a371f7"}
+LIGHT = {"merged": "#6c71c4"}  # the Solarized violet
 palette = dict(DARK)  # the set for the current theme, swapped by BoardApp when the theme changes
 
 
@@ -120,10 +117,16 @@ def card_meta(card: dict, grouping: str) -> str:
         pr_chip(card.get("prs") or []),
         f"☑ {sub['completed']}/{sub['total']}" if sub.get("total") else "",
         sprint_chip(card),
+        assignee_chip(card),
         f"[$text-muted]{escape(card['status'])}[/]" if grouping == "session" and card["status"] else "",
         "[$text-muted]⊘ hidden[/]" if card.get("hidden") else "",
     ]
     return "  ".join(p for p in parts if p)
+
+
+def assignee_chip(card: dict) -> str:
+    """Inside an opened issue, the first assignee of a sub-issue that is not yours."""
+    return f"[$text-muted]@{escape(card['assignees'][0])}[/]" if card.get("isTheirs") and card.get("assignees") else ""
 
 
 def short_ref(key: str, near: str = "") -> str:
@@ -132,50 +135,31 @@ def short_ref(key: str, near: str = "") -> str:
     return f"#{num}" if near and repo == near.split("#")[0] else f"{repo.split('/', 1)[1]} #{num}"
 
 
-parent_slots: dict[str, int] = {}
-parent_keys: list[str] = []  # the parents on the board in a fixed order: the first nine answer to the keys 1-9
-
-
-def assign_parent_colors(cards: list[dict]) -> None:
-    """Give each parent its hashed colour, or the next free one when another parent on the board has it.
-
-    A parent keeps its colour between runs as long as the set of parents does not change around it."""
-    parent_slots.clear()
-    parent_keys[:] = sorted({c["parent"]["key"] for c in cards if c.get("parent")})
-    for key in parent_keys:
-        slot = zlib.crc32(key.encode()) % PARENT_SLOTS
-        free = [(slot + i) % PARENT_SLOTS for i in range(PARENT_SLOTS) if (slot + i) % PARENT_SLOTS not in parent_slots.values()]
-        parent_slots[key] = free[0] if free else slot
-
-
-def parent_color(key: str) -> str:
-    return palette["parents"][parent_slots.get(key, zlib.crc32(key.encode()) % PARENT_SLOTS)]
-
-
-def parent_number(key: str) -> int | None:
-    """The key (1-9) that filters on this parent, for the first nine parents on the board."""
-    n = parent_keys.index(key) + 1 if key in parent_keys else 0
-    return n if 1 <= n <= 9 else None
-
-
-def parent_tag(key: str) -> str:
-    n = parent_number(key)
-    return f"[b]{n}[/b] " if n else ""
-
-
 def parent_chip(card: dict) -> str:
+    """The parent of a board issue: inside an opened issue the breadcrumb names it."""
     parent = card.get("parent")
-    if not parent:
+    if not parent or not card.get("isBoardIssue"):
         return ""
-    return f"[{parent_color(parent['key'])}]{parent_tag(parent['key'])}↳ {escape(short_ref(parent['key'], card['key']))} {escape(parent['title'])}[/]"
+    return f"↳ {escape(short_ref(parent['key'], card['key']))} {escape(parent['title'])}"
 
 
-def group_note(parent: dict | None) -> str:
-    if not parent:
-        return ""
-    sub = parent.get("subIssues") or {}
-    progress = f"  [$text-muted]☑ {sub['completed']}/{sub['total']}[/]" if sub.get("total") else ""
-    return f"[{parent_color(parent['key'])}]{parent_tag(parent['key'])}{escape(short_ref(parent['key']))}[/]{progress}"
+def breadcrumb(opened: list[dict], width: int) -> str:
+    """The path of opened issues: `repo #N title`, then `› #N title` per level, the repository left out where it is
+    the same as the level before. The longest titles are cut first until the line fits width."""
+    refs, before = [], ""
+    for card in opened:
+        repo, num = card["key"].split("#")
+        refs.append(f"#{num}" if repo == before else f"{repo} #{num}")
+        before = repo
+    titles = [card["title"] for card in opened]
+
+    def length() -> int:
+        return sum(len(r) + 1 + len(t) for r, t in zip(refs, titles)) + 3 * (len(titles) - 1)
+
+    while titles and length() > width and max(map(len, titles)) > 1:
+        i = max(range(len(titles)), key=lambda j: len(titles[j]))
+        titles[i] = fit(titles[i], len(titles[i]) - 1)
+    return " [$text-muted]›[/] ".join(f"[$text-muted]{escape(r)}[/] [b]{escape(t)}[/b]" for r, t in zip(refs, titles))
 
 
 def labels_line(card: dict) -> str:
@@ -255,8 +239,8 @@ class CardItem(ListItem):
 
 
 def dimmed(card: dict) -> list[str]:
-    """The classes that dim a card shown although it is off the board: hidden (H), or outside the sprint (s)."""
-    return ["is-hidden"] * bool(card.get("hidden")) + ["is-outside"] * bool(card.get("sprintFiltered"))
+    """The classes that dim a card: shown although it is off the board, hidden (H) or outside the sprint (s), or inside an opened issue someone else's."""
+    return ["is-hidden"] * bool(card.get("hidden")) + ["is-outside"] * bool(card.get("sprintFiltered")) + ["is-theirs"] * bool(card.get("isTheirs"))
 
 
 class SessItem(ListItem):
@@ -304,7 +288,6 @@ class GroupRow(ListItem):
             Horizontal(
                 Label(escape(group["title"]), classes="col-title"),
                 Label(str(group["count"]), classes="col-count"),
-                Label(group.get("note", ""), classes="group-note"),
                 classes="col-header",
             ),
             classes="group-row alert" if group["alert"] else "group-row",
@@ -322,14 +305,14 @@ class CardRow(ListItem):
         super().__init__(
             Horizontal(
                 Label(icon, classes="c-icon"),
-                Label(escape(card["title"]), classes="c-title"),
+                Label(escape(card["title"]) + (f"  {who}" if (who := assignee_chip(card)) else ""), classes="c-title"),
                 IssueLink(ref, url=card["url"], tooltip="Open on GitHub", classes="c-ref"),
                 Label(escape(row_status(card, grouping, group_title)), classes="c-status"),
                 *([Label(sprint_chip(card), classes="c-sprint")] if has_sprints() else []),
                 Label(session_chip(card), classes="c-sessions"),
                 Label(pr_chip(card.get("prs") or []), classes="c-prs"),
                 Label(f"☑ {sub['completed']}/{sub['total']}" if sub.get("total") else "", classes="c-sub"),
-                Label("" if grouping == "parent" else parent_chip(card), classes="c-parent"),
+                Label(parent_chip(card), classes="c-parent"),
                 Label(labels_line(card), classes="c-labels"),
             ),
             classes=" ".join(["row"] + dimmed(card) + ["is-backlog"] * is_backlog(card, grouping)),
@@ -695,7 +678,7 @@ class PickStatus(ModalScreen[str | None]):
         self.dismiss(None)
 
 
-BOARD_ACTIONS = {"search", "attach", "new", "new_unlinked", "new_issue", "open", "status", "link", "unlink", "stop_delete", "hide", "show_hidden", "show_outside", "group", "view", "parent", "refresh", "back"}  # fmt: skip
+BOARD_ACTIONS = {"search", "attach", "sessions", "new", "new_unlinked", "new_issue", "open", "status", "link", "unlink", "stop_delete", "hide", "show_hidden", "show_outside", "group", "view", "refresh", "back"}  # fmt: skip
 
 
 CARD_CSS = """
@@ -712,6 +695,7 @@ class BoardApp(App):
     #status {{ height: 1; padding: 0 1; color: $text-muted; }}
     #filter {{ height: 1; border: none; padding: 0 1; margin-bottom: 1; background: $boost; }}
     #filter:focus {{ background: $accent 20%; }}
+    #crumb {{ height: 1; padding: 0 1; margin-bottom: 1; }}
     #columns {{ height: 1fr; }}
     .col {{ width: 1fr; min-width: {COL_MIN}; height: 1fr; background: $boost; border: round $panel; margin: 0 1 0 0; }}
     .col:last-child {{ margin: 0; }}
@@ -741,7 +725,7 @@ class BoardApp(App):
     .card-ref Link:hover {{ color: $accent; text-style: underline; }}
     .card-parent {{ width: 1fr; height: 1; text-wrap: nowrap; text-overflow: ellipsis; }}
     .card-meta, .card-labels, .card-body {{ width: 1fr; margin-top: 1; }}
-    ListView.cards > ListItem.is-hidden, ListView.cards > ListItem.is-outside {{ text-opacity: 50%; }}
+    ListView.cards > ListItem.is-hidden, ListView.cards > ListItem.is-outside, ListView.cards > ListItem.is-theirs {{ text-opacity: 50%; }}
     ListView.cards > ListItem.divider {{ height: 1; padding: 0 1; margin-bottom: 1; background: transparent; }}
     .col.list ListView.cards > ListItem.divider {{ margin-bottom: 0; }}
     .divider Horizontal {{ height: 1; }}
@@ -763,7 +747,6 @@ class BoardApp(App):
     ListView.cards > ListItem.group-row {{ height: 1; margin-top: 1; padding: 0 1; background: transparent; }}
     ListView.cards > ListItem.group-row:first-child {{ margin-top: 0; }}
     ListItem.group-row .col-header {{ margin: 0; padding: 0; }}
-    .group-note {{ width: auto; margin-left: 1; }}
     .group-row.alert .col-title {{ color: $warning; }}
     .group-row.alert .col-count {{ background: $warning 30%; color: $warning; }}
     .row Horizontal, .list-head {{ height: 1; }}
@@ -807,7 +790,8 @@ class BoardApp(App):
     StopOrDelete #ask .hint {{ margin-top: 1; }}
     """
     BINDINGS: ClassVar[list[BindingType]] = [
-        Binding("enter", "attach", "Attach", show=True, priority=False),
+        Binding("enter", "attach", "Open", show=True, priority=False),
+        Binding("space", "sessions", "Sessions"),
         Binding("slash", "search", "Search"),
         Binding("n", "new", "New session"),
         Binding("N", "new_unlinked", "New unlinked session", show=False),
@@ -822,8 +806,6 @@ class BoardApp(App):
         Binding("s", "show_outside", "Show outside the sprint", show=False),
         Binding("g", "group", "Grouping"),
         Binding("v", "view", "View"),
-        Binding("1", "parent(1)", "Parent", key_display="1-9"),
-        *(Binding(str(n), f"parent({n})", f"Parent {n}", show=False) for n in range(2, 10)),
         Binding("r", "refresh(True)", "Refresh", show=False),
         Binding("escape", "back", "Back", show=False),
         Binding("q", "quit", "Quit"),
@@ -834,7 +816,7 @@ class BoardApp(App):
         self.grouping = "status"
         self.view = "board"
         self.filter = ""
-        self.parent_filter: str | None = None  # the key of the parent issue picked with 1-9
+        self.path: list[str] = []  # the keys of the opened issues, outermost first; empty on the board itself
         self.hidden = core.load_hidden()  # issue keys hidden from the board, kept in hidden.json
         self.show_hidden = False
         self.show_outside = False  # issues outside the sprint, shown with s
@@ -853,6 +835,9 @@ class BoardApp(App):
         )
         filter_box.show(False)
         yield filter_box
+        crumb = Static("", id="crumb")
+        crumb.display = False
+        yield crumb
         yield Columns(id="columns")
         with Horizontal(id="detail"):
             with Vertical(id="detail-issue"):
@@ -908,10 +893,13 @@ class BoardApp(App):
 
     async def show_board(self, data: dict) -> None:
         self.data = data
-        assign_parent_colors([c for c in data["cards"] if not c.get("searchOnly")])
-        if self.parent_filter not in parent_keys:
-            self.parent_filter = None
-        await self.fill_columns()
+        opened = self.opened()
+        if len(opened) < len(self.path):  # an opened issue is gone: the nearest level that is still there
+            # The focus moves to that level only from the board's own lists, never out of the search box or the sessions panel.
+            on_board = self.focused is None or (isinstance(self.focused, ListView) and self.focused.id != "sessions")
+            await self.go_to([c["key"] for c in opened], focus=on_board)
+        else:
+            await self.fill_columns()
         self.update_status()
 
     def theme_changed(self, theme: Theme) -> None:
@@ -931,20 +919,26 @@ class BoardApp(App):
         d = self.data
         state = "refreshing…" if self.loading else f"updated {core.ago(d['fetchedAt'])} ago" if d["fetchedAt"] else "loading…"
         group = f"{self.view} view  ·  grouped by {GROUPINGS[self.grouping]}"
-        if self.parent_filter:
-            title = next(c["parent"]["title"] for c in d["cards"] if (c.get("parent") or {}).get("key") == self.parent_filter)
-            group += f"  ·  parent [{parent_color(self.parent_filter)}]{parent_number(self.parent_filter)} {escape(fit(title, 40))}[/]"
-        # Issues outside the sprint count nowhere while s leaves them out, except against a search, which reaches them.
-        cards = [c for c in d["cards"] if self.show_outside or not c.get("sprintFiltered")]
-        if self.filter or self.parent_filter:
-            shown = sum(1 for c in self.visible(d["cards"]) if self.show_hidden or c["key"] not in self.hidden)
-            text = f"filter [$accent]{escape(self.filter)}[/]: " if self.filter else ""
-            group += f"  ·  {text}{shown} of {plural(len(d['cards'] if self.filter else cards), 'issue')}"
+        # Issues outside the sprint count nowhere on the board while s leaves them out, except against a search, which reaches them.
+        level = self.level_cards()
+        cards = level if self.path else [c for c in level if self.show_outside or not c.get("sprintFiltered")]
+        if self.filter:
+            shown = sum(1 for c in self.level_rows() if self.show_hidden or c["key"] not in self.hidden)
+            group += f"  ·  filter [$accent]{escape(self.filter)}[/]: {shown} of {plural(len(level), 'issue')}"
         if n_hidden := sum(1 for c in cards if c["key"] in self.hidden):
             group += f"  ·  {n_hidden} hidden ({'shown, ' if self.show_hidden else ''}H toggles)"
         group += self.sprint_status()
         errors = f"  ·  [$error]{len(d['errors'])} error(s): {escape(fit(d['errors'][0], 90))}[/]" if d["errors"] else ""
         self.query_one("#status", Static).update(f"{group}  ·  {state}{errors}")
+        self.update_crumb()
+
+    def update_crumb(self) -> None:
+        crumb = self.query_one("#crumb", Static)
+        crumb.display = bool(self.path)
+        crumb.update(breadcrumb(self.opened(), self.size.width - 2))
+
+    def on_resize(self) -> None:
+        self.update_crumb()
 
     def sprint_status(self) -> str:
         """The first sprint project's current sprint, its days left, and how many issues are outside the sprint."""
@@ -962,7 +956,8 @@ class BoardApp(App):
     # --- layout ----------------------------------------------------------------
 
     def column_specs(self) -> list[tuple[str, str]]:
-        return [*core.columns(self.grouping), ("unlinked", "Unlinked")]
+        """The columns of the grouping, and on the board itself the unlinked sessions."""
+        return [*core.columns(self.grouping), *([] if self.path else [("unlinked", "Unlinked")])]
 
     async def build_columns(self) -> None:
         box = self.query_one("#columns", Columns)
@@ -984,7 +979,7 @@ class BoardApp(App):
 
     async def replace_items(self, lv: ListView, rows: list[dict], make, keep: str | None) -> None:
         """Redraw a list only when its rows changed, keeping the highlighted row by key and the focus where it was."""
-        signature = json.dumps(rows, sort_keys=True, default=str) + self.grouping + json.dumps(parent_slots, sort_keys=True) + json.dumps(palette)
+        signature = json.dumps(rows, sort_keys=True, default=str) + self.grouping + json.dumps(palette)
         if self.signatures.get(lv.id or "") == signature:
             return
         self.signatures[lv.id or ""] = signature
@@ -1012,22 +1007,44 @@ class BoardApp(App):
                 lv.index = match
 
     def visible(self, rows: list[dict]) -> list[dict]:
-        """The rows to draw: a filter also reaches the search-only cards (finished issues that left the board).
-
-        A parent picked with 1-9 leaves only that issue and its sub-issues, so no unlinked session."""
+        """The rows to draw: a filter also reaches the search-only cards (finished issues that left the board)."""
         if self.filter:
-            rows = [r for r in rows if core.matches(r, self.filter)]
-        else:
-            rows = [r for r in rows if not r.get("searchOnly") or (self.show_outside and r.get("sprintFiltered"))]
-        if self.parent_filter:
-            rows = [r for r in rows if "sessions" in r and self.parent_filter in (r["key"], (r.get("parent") or {}).get("key"))]
-        return rows
+            return [r for r in rows if core.matches(r, self.filter)]
+        return [r for r in rows if not r.get("searchOnly") or (self.show_outside and r.get("sprintFiltered"))]
+
+    def opened(self) -> list[dict]:
+        """The opened issues as the data has them, outermost first, up to the first one that is gone or has no sub-issues left."""
+        chain, cards = [], self.data["cards"]
+        for key in self.path:
+            card = next((c for c in cards if c["key"] == key and c.get("subtree")), None)
+            if card is None:
+                break
+            chain.append(card)
+            cards = card["subtree"]
+        return chain
+
+    def level_cards(self) -> list[dict]:
+        """The cards of the current level: the board's, or the opened issue's direct sub-issues in board order."""
+        opened = self.opened()
+        return sorted(opened[-1]["subtree"], key=core.board_order) if opened else self.data["cards"]
+
+    def level_rows(self) -> list[dict]:
+        """The cards of the current level to draw, hidden ones included.
+
+        Inside an opened issue that is every sub-issue, whatever its sprint or state: none is dimmed for being
+        outside the sprint, and one with no assignee of yours is dimmed as someone else's."""
+        if not self.path:
+            return self.visible(self.data["cards"])
+        viewer = (self.data.get("viewer") or "").lower()
+        cards = [{**c, "sprintFiltered": False, "isTheirs": bool(viewer) and viewer not in (a.lower() for a in c.get("assignees") or [])} for c in self.level_cards()]
+        return [c for c in cards if core.matches(c, self.filter)] if self.filter else cards
 
     def groups(self) -> list[dict]:
-        cards = [{**c, "hidden": True} if c["key"] in self.hidden else c for c in self.visible(self.data["cards"])]
+        cards = [{**c, "hidden": True} if c["key"] in self.hidden else c for c in self.level_rows()]
         if not self.show_hidden:
             cards = [c for c in cards if not c.get("hidden")]
-        return [*core.groups(cards, self.grouping), {"id": "unlinked", "title": "Unlinked", "parent": None, "cards": self.visible(self.data["unlinked"])}]
+        unlinked = [] if self.path else [{"id": "unlinked", "title": "Unlinked", "cards": self.visible(self.data["unlinked"])}]
+        return [*core.groups(cards, self.grouping), *unlinked]
 
     @staticmethod
     def group_alert(col_id: str, rows: list[dict]) -> bool:
@@ -1038,7 +1055,7 @@ class BoardApp(App):
         for group in self.groups():
             col_id, title, members = group["id"], group["title"], group["cards"]
             if members:
-                rows.append({"group": col_id, "title": title, "count": len(members), "alert": self.group_alert(col_id, members), "note": group_note(group["parent"])})
+                rows.append({"group": col_id, "title": title, "count": len(members), "alert": self.group_alert(col_id, members)})
                 rows.extend(m if "divider" in m else {**m, "groupTitle": title} for m in with_divider(members, self.grouping))
 
         def make(r: dict) -> ListItem:
@@ -1092,7 +1109,7 @@ class BoardApp(App):
         if not cur:
             return None
         if "sessions" in cur:
-            fresh = next((c for c in self.data["cards"] if c["key"] == cur["key"]), None)
+            fresh = next((c for c in self.level_cards() if c["key"] == cur["key"]), None)
         else:
             fresh = next((s for s in self.data["unlinked"] if s["id"] == cur["id"]), None)
         if fresh is not None:
@@ -1157,11 +1174,11 @@ class BoardApp(App):
             await self.show_detail()
 
     @on(ListView.Selected)
-    def selected(self, event: ListView.Selected) -> None:
+    async def selected(self, event: ListView.Selected) -> None:
         if isinstance(event.item, (SessItem, SessRow, SessDetailRow)):
             self.attach(event.item.sess)
         elif isinstance(event.item, (CardItem, CardRow)):
-            self.open_sessions(event.item.card)
+            await self.enter_card(event.item.card)
 
     @on(Input.Changed, "#filter")
     async def filter_changed(self, event: Input.Changed) -> None:
@@ -1188,6 +1205,39 @@ class BoardApp(App):
         box = self.query_one("#filter", FilterInput)
         box.show(True)
         box.focus()
+
+    async def enter_card(self, card: dict) -> None:
+        """Open an issue that has sub-issues; on any other card, focus its sessions.
+
+        A card that only a search or s shows has no sub-issues read, so it never opens."""
+        if card.get("subtree"):
+            await self.go_to([*self.path, card["key"]])
+        else:
+            self.open_sessions(card)
+
+    async def go_to(self, path: list[str], select: dict | None = None, focus: bool = True) -> None:
+        """Show another level and select a card on it, the one given else the first; with focus, focus it too."""
+        rebuild = bool(path) != bool(self.path)  # the Unlinked column comes or goes
+        self.path = path
+        self.current = select
+        if rebuild:
+            await self.build_columns()
+        else:
+            for lv in self.query(".col ListView").results(ListView):
+                with lv.prevent(ListView.Highlighted):
+                    lv.index = None  # a fresh level: no cursor carried over from the last one
+        await self.fill_columns()
+        if select is None:
+            for lv in self.query(".col ListView").results(ListView):
+                first = next((i for i, it in enumerate(lv.children) if isinstance(it, (CardItem, CardRow))), None)
+                if first is not None:
+                    lv.index = first
+                    self.current, self.selection_list = self.payload(lv.highlighted_child), lv
+                    await self.show_detail()
+                    break
+        self.update_status()
+        if focus:
+            self.focus_board()
 
     def open_sessions(self, card: dict) -> None:
         sessions = self.query_one("#sessions", CardList)
@@ -1219,14 +1269,22 @@ class BoardApp(App):
 
     # --- actions ---------------------------------------------------------------
 
-    def action_attach(self) -> None:
+    async def action_attach(self) -> None:
         lv = self.query_one("#sessions", ListView)
         if lv.has_focus and isinstance(lv.highlighted_child, SessDetailRow):
             self.attach(lv.highlighted_child.sess)
         elif self.current and "sessions" in self.current:
-            self.open_sessions(self.current)  # a card always goes to its sessions, even when it has only one
+            await self.enter_card(self.current)  # a card never attaches, even when it has only one session
         elif self.current:
             self.attach(self.current)
+
+    def action_sessions(self) -> None:
+        if self.current and "sessions" in self.current:
+            self.open_sessions(self.current)
+        elif self.current:  # an unlinked session: its row in the sessions panel
+            sessions = self.query_one("#sessions", CardList)
+            sessions.action_first()
+            sessions.focus()
 
     @work(thread=True)
     def attach(self, sess: dict) -> None:
@@ -1248,21 +1306,11 @@ class BoardApp(App):
         except Exception as err:  # noqa: BLE001
             self.call_from_thread(self.notify, f"Attach failed: {err}", severity="error")
 
-    async def action_parent(self, number: int) -> None:
-        """Show only the sub-issues of the numbered parent (and the parent's own card); the same key again shows everything."""
-        if number > len(parent_keys):
-            self.notify(f"No parent issue {number} on the board.")
-            return
-        key = parent_keys[number - 1]
-        self.parent_filter = None if self.parent_filter == key else key
-        await self.fill_columns()
-        self.update_status()
-
     async def action_back(self) -> None:
-        if self.parent_filter and not self.query_one("#sessions", ListView).has_focus:
-            self.parent_filter = None
-            await self.fill_columns()
-            self.update_status()
+        """Out of the sessions panel to the board columns; from there up one level, onto the issue that was open."""
+        if self.path and not self.query_one("#sessions", ListView).has_focus:
+            opened = self.opened()
+            await self.go_to(self.path[:-1], opened[-1] if opened else None)
             return
         self.focus_board()
 
@@ -1274,8 +1322,7 @@ class BoardApp(App):
                 return
 
     async def action_group(self) -> None:
-        # By parent issue is a list grouping: its groups come and go with the issues, and the board's columns are fixed.
-        order = [g for g in GROUPINGS if g != "parent" or self.view == "list"]
+        order = list(GROUPINGS)
         self.grouping = order[(order.index(self.grouping) + 1) % len(order)]
         await self.build_columns()
         await self.fill_columns()
@@ -1283,8 +1330,6 @@ class BoardApp(App):
 
     async def action_view(self) -> None:
         self.view = "list" if self.view == "board" else "board"
-        if self.view == "board" and self.grouping == "parent":
-            self.grouping = "status"
         await self.build_columns()
         await self.fill_columns()
         self.update_status()
