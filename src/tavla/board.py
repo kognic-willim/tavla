@@ -840,6 +840,30 @@ def lookup_directly(keys: list[str], meta: dict[str, dict], errors: list[str], f
             meta[key] = info
 
 
+def keep_finished_with_work_below(cards: list[dict], meta: dict[str, dict], errors: list[str], force: bool, offline: bool, fresh_after: float) -> None:
+    """A finished issue stays on the board while a session anywhere in its subtree is live or recent.
+
+    Its subtree is read only once it is back on the board, so this climbs the other way: from each issue with such a
+    session up its parents, one batched lookup a level for the parents not known yet, and puts back every finished card
+    on the way."""
+    finished = {c["key"]: c for c in cards if c["searchOnly"] and not c["sprintFiltered"]}
+    if not finished:
+        return
+    recent = now_ms() - RECENT_S * 1000
+    level = [c["key"] for c in cards if any(s["kind"] != "idle" or s["updatedAt"] >= recent for s in c["sessions"])]
+    seen = set(level)
+    for _ in range(SUB_ISSUE_LEVELS):
+        parents = list(dict.fromkeys(p["key"] for k in level if (p := (meta.get(k) or {}).get("parent")) and p["key"] not in seen))
+        if not parents:
+            break
+        seen.update(parents)
+        lookup_directly([p for p in parents if p not in meta], meta, errors, force, offline, fresh_after)
+        for key in parents:
+            if key in finished:
+                finished[key]["searchOnly"] = False
+        level = parents
+
+
 def attach_subtrees(cards: list[dict], make_card, meta: dict[str, dict], errors: list[str], force: bool, offline: bool, fresh_after: float) -> None:
     """Give each card on the board its subtree, as nested cards, and say which cards are board issues.
 
@@ -996,6 +1020,7 @@ def _build_board(force: bool, offline: bool) -> dict:
     from_sessions = {key_of(r) for r in session_refs}
     meta: dict[str, dict] = {}  # full GraphQL view of each issue, for the card metadata
     closed_by: dict[str, list[dict]] = {}  # the session PRs that close each issue
+    session_parents: list[str] = []  # the parents of the issues sessions are on, for keep_finished_with_work_below
     for key, info in infos.items():
         for i in [info] if info["kind"] == "Issue" else info["closes"]:
             if info["kind"] == "Issue" or i["key"] not in meta:  # a PR's closing list reads less than a direct lookup
@@ -1004,10 +1029,12 @@ def _build_board(force: bool, offline: bool) -> dict:
                 closed_by.setdefault(i["key"], []).append({"key": info["key"], "url": info["url"], "state": info["state"]})
             if key in from_sessions:
                 add_issue(i["key"], i["title"], i["url"], i["isOpen"], i["updatedAt"])
+                session_parents += [i["parent"]["key"]] if i.get("parent") else []
             elif i["key"] in issues:
                 issues[i["key"]]["isOpen"] = i["isOpen"]
-    # An issue known only from a PR's closing list is looked up directly, for its labels, closing PRs and sub-issues.
-    lookup_directly(list(issues), meta, errors, force, offline, started)
+    # An issue known only from a PR's closing list is looked up directly, for its labels, closing PRs and sub-issues;
+    # the parents of the issues sessions are on ride along, so the climb in keep_finished_with_work_below rarely asks again.
+    lookup_directly(list(dict.fromkeys([*issues, *session_parents])), meta, errors, force, offline, started)
 
     sessions = []
     for sess, refs in raw:
@@ -1076,7 +1103,9 @@ def _build_board(force: bool, offline: bool) -> dict:
         card = make_card(key, iss)
         if card["sessionColumn"] != "backlog" or iss["isMine"]:
             cards.append(card)
+    keep_finished_with_work_below(cards, meta, errors, force, offline, started)
     attach_subtrees(cards, make_card, meta, errors, force, offline, started)
+    roll_up(cards, load_hidden())
     # Unlinked means on no card and in no card's subtree: no issue found, or its issue has no card (e.g. GitHub couldn't be asked).
     on_card = set().union(*(subtree_keys(c) for c in cards))
     # A card inside a board issue's subtree shows only there: the flat list holds the board issues and the search-only cards under none.
@@ -1103,9 +1132,63 @@ def subtree_keys(card: dict) -> set[str]:
     return keys
 
 
+def session_state(sessions: list[dict]) -> str:
+    """The session column of an issue with these sessions: needs you, working, idle, or none (backlog)."""
+    kinds = {s["kind"] for s in sessions}
+    return "needs" if "needs" in kinds else "working" if "working" in kinds else "idle" if sessions else "backlog"
+
+
+def subtree_sessions(card: dict, hidden: set[str]) -> list[tuple[dict, list[str]]]:
+    """The sessions on the issues of a card's subtree that are not on the card itself, newest first, each once with
+    the sub-issues it is on in tree order. A hidden sub-issue and its subtree are left out."""
+    own = {s["id"] for s in card["sessions"]}
+    found: dict[str, tuple[dict, list[str]]] = {}
+    for sub in every_sub_issue(card, hidden)[1:]:
+        for s in sub["sessions"]:
+            if s["id"] not in own:
+                found.setdefault(s["id"], (s, []))[1].append(sub["key"])
+    return sorted(found.values(), key=lambda f: -f[0]["updatedAt"])
+
+
+def roll_up(cards: list[dict], hidden: set[str]) -> None:
+    """Give every card in the trees its roll-up: the state, sessions and PRs of the card and its subtree, and
+    how many of the issues under it are closed. A hidden sub-issue and its subtree leave the sessions and PRs
+    of every card above it, and still count in subIssues. A card whose subtree was not read keeps GitHub's own count."""
+    done: set[int] = set()
+    todo = list(cards)
+    while todo:
+        card = todo.pop()
+        if id(card) in done:
+            continue
+        done.add(id(card))
+        todo += card["subtree"]
+        sessions = [*card["sessions"], *(s for s, _ in subtree_sessions(card, hidden))]
+        under = every_sub_issue(card)[1:]
+        prs = {p["key"]: p for c in every_sub_issue(card, hidden) for p in c["prs"]}
+        card["rollup"] = {
+            "sessionColumn": session_state(sessions),
+            "sessions": [s["id"] for s in sessions],
+            "live": sum(1 for s in sessions if s["kind"] != "idle"),
+            "prs": list(prs.values()),
+            "subIssues": {"total": len(under), "completed": sum(1 for c in under if not c["isOpen"])} if under else card["subIssues"],
+        }
+
+
+def every_sub_issue(card: dict, hidden: set[str] = frozenset()) -> list[dict]:
+    """The card and every issue in its subtree, each once, the card first; less the hidden sub-issues and their subtrees."""
+    out: dict[str, dict] = {}
+    todo = [card]
+    while todo:
+        c = todo.pop(0)
+        if c["key"] not in out and (c is card or c["key"] not in hidden):
+            out[c["key"]] = c
+            todo += c["subtree"]
+    return list(out.values())
+
+
 def board_order(card: dict) -> tuple[int, int]:
-    """Cards needing you first, then working ones, then the most recently updated."""
-    return ({"needs": 0, "working": 1}.get(card["sessionColumn"], 2), -card["updatedAt"])
+    """Cards with a session needing you anywhere under them first, then working ones, then the most recently updated."""
+    return ({"needs": 0, "working": 1}.get(card["rollup"]["sessionColumn"], 2), -card["updatedAt"])
 
 
 def columns(grouping: str) -> list[tuple[str, str]]:
@@ -1113,7 +1196,7 @@ def columns(grouping: str) -> list[tuple[str, str]]:
 
 
 def column_of(card: dict, grouping: str) -> str:
-    return STATUS_BUCKET[card["statusColumn"]] if grouping == "status" else SESSION_BUCKET[card["sessionColumn"]]
+    return STATUS_BUCKET[card["statusColumn"]] if grouping == "status" else SESSION_BUCKET[card["rollup"]["sessionColumn"]]
 
 
 def column_cards(cards: list[dict], col_id: str, grouping: str) -> list[dict]:
@@ -1130,12 +1213,12 @@ def groups(cards: list[dict], grouping: str) -> list[dict]:
 
 
 def badge(card: dict) -> str:
-    ss = card["sessions"]
-    if not ss:
+    """The roll-up's sessions: `! 2s/1 live`."""
+    rollup = card["rollup"]
+    if not rollup["sessions"]:
         return ""
-    live = sum(1 for s in ss if s["kind"] != "idle")
-    mark = {"needs": "! ", "working": "~ "}.get(card["sessionColumn"], "")
-    return f"{mark}{len(ss)}s" + (f"/{live} live" if live else "")
+    mark = {"needs": "! ", "working": "~ "}.get(rollup["sessionColumn"], "")
+    return f"{mark}{len(rollup['sessions'])}s" + (f"/{rollup['live']} live" if rollup["live"] else "")
 
 
 def ago(ms: int) -> str:

@@ -73,12 +73,13 @@ def label_chip(name: str, color: str) -> str:
 
 
 def session_chip(card: dict) -> str:
-    ss = card["sessions"]
-    if not ss:
+    """The state and number of the sessions on the issue and in its subtree."""
+    n = len(card["rollup"]["sessions"])
+    if not n:
         return ""
-    col = card["sessionColumn"]
-    text = {"needs": "needs you", "working": "working"}.get(col, plural(len(ss), "session"))
-    extra = f" [$text-muted]· {plural(len(ss), 'session')}[/]" if col in ("needs", "working") and len(ss) > 1 else ""
+    col = card["rollup"]["sessionColumn"]
+    text = {"needs": "needs you", "working": "working"}.get(col, plural(n, "session"))
+    extra = f" [$text-muted]· {plural(n, 'session')}[/]" if col in ("needs", "working") and n > 1 else ""
     return f"[{SESSION_COLOR[col]}]{GLYPH[col]} {text}[/]{extra}"
 
 
@@ -110,12 +111,17 @@ def sprint_chip(card: dict) -> str:
     return f"[{'$warning' if warn else '$text-muted'}]{escape(sprint['title'] or 'no sprint')}[/]"
 
 
+def sub_chip(card: dict) -> str:
+    """How many of the issues in the subtree are closed."""
+    sub = card["rollup"]["subIssues"]
+    return f"☑ {sub['completed']}/{sub['total']}" if sub.get("total") else ""
+
+
 def card_meta(card: dict, grouping: str) -> str:
-    sub = card.get("subIssues") or {}
     parts = [
         session_chip(card),
-        pr_chip(card.get("prs") or []),
-        f"☑ {sub['completed']}/{sub['total']}" if sub.get("total") else "",
+        pr_chip(card["rollup"]["prs"]),
+        sub_chip(card),
         sprint_chip(card),
         assignee_chip(card),
         f"[$text-muted]{escape(card['status'])}[/]" if grouping == "session" and card["status"] else "",
@@ -164,6 +170,12 @@ def breadcrumb(opened: list[dict], width: int) -> str:
 
 def labels_line(card: dict) -> str:
     return " ".join(label_chip(lb["name"], lb["color"]) for lb in card.get("labels") or [])
+
+
+def on_issue(keys: list[str], key: str) -> str:
+    """The sub-issues a session works on, as the issue whose panel lists it names them: `#41`, `tools #41`
+    in another repository, and `+N` for any more."""
+    return short_ref(keys[0], key) + (f" +{len(keys) - 1}" if len(keys) > 1 else "")
 
 
 def ref_parts(card: dict) -> tuple[str, str]:
@@ -234,7 +246,7 @@ class CardItem(ListItem):
             rows.append(Label(meta, classes="card-meta"))
         if labels := labels_line(card):
             rows.append(Label(labels, classes="card-labels"))
-        classes = ["card"] + ["has-session"] * bool(card["sessions"]) + dimmed(card) + ["is-backlog"] * is_backlog(card, grouping)
+        classes = ["card"] + ["has-session"] * bool(card["rollup"]["sessions"]) + dimmed(card) + ["is-backlog"] * is_backlog(card, grouping)
         super().__init__(*rows, classes=" ".join(classes))
 
 
@@ -265,7 +277,7 @@ class SessDetailRow(ListItem):
         super().__init__(
             Horizontal(
                 Label(f"[{SESSION_COLOR[kind]}]{glyph} {escape(sess['state'])}[/]", classes="s-state"),
-                Label(escape(sess["name"]), classes="s-name"),
+                Label((f"[$text-muted]{escape(sess['onIssue'])}[/] " if sess.get("onIssue") else "") + escape(sess["name"]), classes="s-name"),
                 Label(core.ago(sess["updatedAt"]), classes="s-ago"),
                 Label(sess["id"], classes="s-id"),
                 Label(prs, classes="s-prs"),
@@ -301,7 +313,6 @@ class CardRow(ListItem):
     def __init__(self, card: dict, grouping: str, group_title: str) -> None:
         self.card = card
         icon, ref = ref_parts(card)
-        sub = card.get("subIssues") or {}
         super().__init__(
             Horizontal(
                 Label(icon, classes="c-icon"),
@@ -310,8 +321,8 @@ class CardRow(ListItem):
                 Label(escape(row_status(card, grouping, group_title)), classes="c-status"),
                 *([Label(sprint_chip(card), classes="c-sprint")] if has_sprints() else []),
                 Label(session_chip(card), classes="c-sessions"),
-                Label(pr_chip(card.get("prs") or []), classes="c-prs"),
-                Label(f"☑ {sub['completed']}/{sub['total']}" if sub.get("total") else "", classes="c-sub"),
+                Label(pr_chip(card["rollup"]["prs"]), classes="c-prs"),
+                Label(sub_chip(card), classes="c-sub"),
                 Label(parent_chip(card), classes="c-parent"),
                 Label(labels_line(card), classes="c-labels"),
             ),
@@ -1048,7 +1059,7 @@ class BoardApp(App):
 
     @staticmethod
     def group_alert(col_id: str, rows: list[dict]) -> bool:
-        return (col_id == "blocked" and bool(rows)) or any(r.get("sessionColumn") == "needs" for r in rows)
+        return (col_id == "blocked" and bool(rows)) or any(r.get("rollup", {}).get("sessionColumn") == "needs" for r in rows)
 
     async def fill_list(self, keep: str | None) -> None:
         rows: list[dict] = []
@@ -1134,24 +1145,25 @@ class BoardApp(App):
             link.text, link.url = ref, cur["url"]
             body = cur.get("body") or "*No description.*"
             sessions = cur["sessions"]
+            below = [{**s, "onIssue": on_issue(keys, cur["key"])} for s, keys in core.subtree_sessions(cur, self.hidden)]
             past = cur.get("pastSessions") or []
         elif cur:
             icon.update(f"[{SESSION_COLOR[cur['kind']]}]{GLYPH[cur['kind']]}[/]")
             link.text, link.url = f"unlinked session {cur['id']}", ""
             body = cur.get("intent") or "*No prompt recorded.*"
-            sessions, past = [cur], []
+            sessions, below, past = [cur], [], []
         else:
             icon.update("")
             link.text, link.url = "Select a card", ""
             body = ""
-            sessions, past = [], []
+            sessions, below, past = [], [], []
         if body != self.body_shown:
             self.body_shown = body
             await self.query_one("#detail-body", Markdown).update(body)
             self.query_one("#detail-body-scroll", VerticalScroll).scroll_home(animate=False)
-        self.query_one("#count-sessions", Label).update(str(len(sessions)))
-        # Deleted and ended sessions come last, under their own divider, as Backlog cards do in a column.
-        rows = [*sessions, *([{"divider": "Deleted", "count": len(past)}, *past] if past else [])]
+        self.query_one("#count-sessions", Label).update(str(len(sessions) + len(below)))
+        # The subtree's sessions come after the issue's own, and its deleted and ended ones last, each under a divider.
+        rows = [*sessions, *([{"divider": "Sub-issues", "count": len(below)}, *below] if below else []), *([{"divider": "Deleted", "count": len(past)}, *past] if past else [])]
         await self.replace_items(self.query_one("#sessions", ListView), rows, lambda r: Divider(r) if "divider" in r else SessDetailRow(r), None)
 
     # --- events ----------------------------------------------------------------
@@ -1241,7 +1253,7 @@ class BoardApp(App):
 
     def open_sessions(self, card: dict) -> None:
         sessions = self.query_one("#sessions", CardList)
-        if card["sessions"] or card.get("pastSessions"):
+        if card["rollup"]["sessions"] or card.get("pastSessions"):
             sessions.action_first()  # with only deleted sessions the first row is their divider
             sessions.focus()
         else:
@@ -1342,6 +1354,9 @@ class BoardApp(App):
             return
         self.hidden = core.toggle_hidden(card["key"])
         hiding = card["key"] in self.hidden
+        # A hidden sub-issue leaves the roll-up of every card above it, at once rather than at the next refresh.
+        core.roll_up(self.data["cards"], self.hidden)
+        self.data["cards"].sort(key=core.board_order)
         await self.refill_after_toggle()
         self.notify((f"Hid {card['key']}" + ("" if self.show_hidden else "; H shows hidden issues")) if hiding else f"Unhid {card['key']}")
 
