@@ -136,6 +136,9 @@ def fake_graphql(query, variables=None):
         else:
             assert "$sprint" not in query  # a project with no sprint key asks for nothing more than before
         return {"data": {"repositoryOwner": {"projectV2": project}}}
+    if query.strip().startswith("{ viewer"):
+        GRAPHQL_CALLS.append("viewer")
+        return {"data": {"viewer": {"login": "me"}}}
     GRAPHQL_CALLS.append("refs")
     data = {}
     closes_read = int(m[1]) if (m := re.search(r"closingIssuesReferences\(first: (\d+)\)", query)) else 0
@@ -212,6 +215,23 @@ def env(tmp_path, monkeypatch):
     SPRINT_FIELDS.clear()
     RESUMED.clear()
     UNREADABLE.clear()
+
+
+@pytest.fixture
+def lone_todo(monkeypatch):
+    """acme/infra#11 as a board issue of its own: no parent, and acme/infra#9 lists no sub-issues."""
+    monkeypatch.setitem(SUB_ISSUES, "acme/infra#9", [])
+    monkeypatch.delitem(PARENTS, "acme/infra#11")
+
+
+def every_card(board):
+    """Every card of the board, the ones inside a board issue's subtree too, by key."""
+    out, todo = {}, list(board["cards"])
+    while todo:
+        c = todo.pop(0)
+        out.setdefault(c["key"], c)
+        todo += c["subtree"]
+    return out
 
 
 def test_routine_refresh_reads_github_metadata_from_cache():
@@ -307,7 +327,7 @@ def test_one_unreadable_project_keeps_its_cached_statuses(monkeypatch):
         return {} if "projectV2" in query and variables["owner"] == "team" else fake_graphql(query, variables)
 
     monkeypatch.setattr(core, "graphql", team_down)
-    status = {c["key"]: c["status"] for c in core.build_board(force=True)["cards"]}
+    status = {k: c["status"] for k, c in every_card(core.build_board(force=True)).items()}
     assert status["acme/infra#11"] == "In progress"  # the readable project is fresh
     assert status["acme/infra#7"] == "Blocked"  # the unreadable one keeps its last answer
 
@@ -903,14 +923,14 @@ def test_tui_new_issue_defaults_to_personal_then_starts_and_attaches_a_session(m
 
 
 def test_start_progress_moves_a_todo_card_on_its_own_project_and_the_next_refresh_shows_it():
-    cards = {c["key"]: c for c in core.build_board()["cards"]}
+    cards = every_card(core.build_board())
     todo, blocked = cards["acme/infra#11"], cards["acme/infra#7"]
     assert todo["statusItem"] == {"project": "me/1", "itemId": "PVTI_11"}
     assert core.start_progress(blocked) is False and STATUS_SETS == []  # only Todo moves
     assert core.start_progress(todo) is True
     assert STATUS_SETS == [{"project": "PVT_me", "item": "PVTI_11", "field": "PVTSSF_status", "option": "opt-progress"}]
     GRAPHQL_CALLS.clear()
-    card = next(c for c in core.build_board()["cards"] if c["key"] == "acme/infra#11")
+    card = every_card(core.build_board())["acme/infra#11"]  # a sub-issue of acme/infra#9
     assert (card["status"], card["statusColumn"]) == ("In progress", "progress")
     assert not any(c.startswith("project") for c in GRAPHQL_CALLS)  # from the patched cache
 
@@ -933,15 +953,15 @@ def test_set_status_moves_a_card_to_any_status_of_its_project_and_reads_the_opti
 def test_an_issue_with_no_status_takes_one_on_the_first_project_it_is_on(monkeypatch):
     monkeypatch.setitem(PROJECTS, "me", [item("acme/infra", 11, "Personal todo", None)])
     monkeypatch.setitem(PROJECTS, "team", [item("acme/infra", 11, "Personal todo", None)])
-    card = next(c for c in core.build_board()["cards"] if c["key"] == "acme/infra#11")
+    card = every_card(core.build_board())["acme/infra#11"]
     assert (card["status"], card["statusItem"]) == ("", {"project": "me/1", "itemId": "PVTI_11"})
     # A project that does give it a status wins over an earlier one that gives none.
     monkeypatch.setitem(PROJECTS, "team", [item("acme/infra", 11, "Personal todo", "Blocked")])
-    card = next(c for c in core.build_board(force=True)["cards"] if c["key"] == "acme/infra#11")
+    card = every_card(core.build_board(force=True))["acme/infra#11"]
     assert (card["status"], card["statusItem"]) == ("Blocked", {"project": "team/23", "itemId": "PVTI_11"})
 
 
-def test_tui_u_lists_the_project_statuses_and_a_number_or_enter_sets_one(monkeypatch):
+def test_tui_u_lists_the_project_statuses_and_a_number_or_enter_sets_one(lone_todo, monkeypatch):
     from tavla import tui
 
     async def scenario():
@@ -993,7 +1013,7 @@ def test_tui_u_lists_the_project_statuses_and_a_number_or_enter_sets_one(monkeyp
     asyncio.run(scenario())
 
 
-def test_tui_new_session_offers_in_progress_only_on_todo_cards(monkeypatch):
+def test_tui_new_session_offers_in_progress_only_on_todo_cards(lone_todo, monkeypatch):
     from tavla import tui
 
     started, moved = [], []
@@ -1044,7 +1064,7 @@ def test_tui_new_session_offers_in_progress_only_on_todo_cards(monkeypatch):
 BACKLOG = [item("acme/infra", 21, "Someday thing", "Backlog"), item("acme/infra", 11, "Personal todo", "Todo"), item("acme/infra", 22, "Another someday", "Backlog")]
 
 
-def test_backlog_cards_sort_after_the_other_todo_cards(monkeypatch):
+def test_backlog_cards_sort_after_the_other_todo_cards(lone_todo, monkeypatch):
     monkeypatch.setitem(PROJECTS, "me", BACKLOG)
     board = core.build_board()
     todo = [c["key"] for c in core.column_cards(board["cards"], "todo", "status")]
@@ -1062,7 +1082,7 @@ def test_start_progress_moves_a_backlog_card_too(monkeypatch):
     assert STATUS_SETS == [{"project": "PVT_me", "item": "PVTI_21", "field": "PVTSSF_status", "option": "opt-progress"}]
 
 
-def test_tui_backlog_cards_sit_dimmed_under_a_divider_at_the_bottom_of_todo(monkeypatch):
+def test_tui_backlog_cards_sit_dimmed_under_a_divider_at_the_bottom_of_todo(lone_todo, monkeypatch):
     from tavla import tui
 
     monkeypatch.setitem(PROJECTS, "me", BACKLOG)
@@ -1205,7 +1225,7 @@ def test_filter_matches_every_word_across_title_ref_status_labels_and_sessions()
     assert core.matches(side, "question") and core.matches(side, "cccc") and not core.matches(side, "flaky")
 
 
-def test_tui_slash_filters_board_and_list_then_enter_selects_and_esc_clears():
+def test_tui_slash_filters_board_and_list_then_enter_selects_and_esc_clears(lone_todo):
     from tavla import tui
 
     async def scenario():
@@ -1321,7 +1341,7 @@ def test_toggle_hidden_hides_then_shows_an_issue_and_survives_a_reload():
     assert core.load_hidden() == {"acme/infra#7"}
 
 
-def test_tui_h_hides_a_card_from_board_and_list_and_shift_h_shows_hidden_ones():
+def test_tui_h_hides_a_card_from_board_and_list_and_shift_h_shows_hidden_ones(lone_todo):
     from tavla import tui
 
     async def scenario(hidden_at_start):
@@ -1597,7 +1617,7 @@ def test_tui_refresh_asked_for_mid_load_runs_after_it(monkeypatch):
     asyncio.run(scenario())
 
 
-def test_tui_new_session_refreshes_before_moving_the_issue_to_in_progress(monkeypatch):
+def test_tui_new_session_refreshes_before_moving_the_issue_to_in_progress(lone_todo, monkeypatch):
     from tavla import tui
 
     order = []
@@ -1868,7 +1888,7 @@ def test_tui_deleted_sessions_come_last_under_a_divider_and_enter_resumes_and_at
     asyncio.run(scenario())
 
 
-def test_tui_enter_on_a_card_with_only_deleted_sessions_lands_on_the_first_of_them(monkeypatch):
+def test_tui_enter_on_a_card_with_only_deleted_sessions_lands_on_the_first_of_them(lone_todo, monkeypatch):
     from tavla import tui
 
     delete_job(monkeypatch, "cccc3333", "cccc3333-aaaa-bbbb")
@@ -1904,18 +1924,7 @@ def test_cards_carry_their_parent_issue_and_a_filter_matches_it():
     assert [k for k, c in cards.items() if not c["searchOnly"] and core.matches(c, "reliable rollouts")] == ["acme/infra#7"]
 
 
-def test_groups_by_parent_issue_with_a_parent_card_leading_its_own_group():
-    board = core.build_board()
-    groups = {g["id"]: g for g in core.groups([c for c in board["cards"] if not c["searchOnly"]], "parent")}
-    assert [c["key"] for c in groups["acme/platform#2"]["cards"]] == ["acme/infra#7"]
-    assert [c["key"] for c in groups["acme/infra#9"]["cards"]] == ["acme/infra#9", "acme/infra#11"]  # the parent is a card too, and leads
-    assert list(groups)[-1] == "none" and [c["key"] for c in groups["none"]["cards"]] == ["acme/charts#3"]
-    text = core.summary(board, "parent")
-    assert "## Reliable rollouts (1) [acme/platform#2 1/4 done]\n- acme/infra#7 Deploy is flaky [Blocked]" in text
-    assert "## No parent (1)\n- acme/charts#3" in text
-
-
-def test_tui_card_and_list_row_name_the_parent_issue():
+def test_tui_a_board_issue_names_its_parent_plainly_on_its_card_and_list_row():
     from tavla import tui
 
     async def scenario():
@@ -1923,101 +1932,21 @@ def test_tui_card_and_list_row_name_the_parent_issue():
         async with app.run_test(size=(190, 45)) as pilot:
             await app.workers.wait_for_complete()
             await pilot.pause()
-            assert str(app.query_one("#col-blocked CardItem .card-parent").render()) == "2 ↳ platform #2 Reliable rollouts"
+            parent = app.query_one("#col-blocked CardItem .card-parent")
+            assert str(parent.content) == "↳ platform #2 Reliable rollouts"  # no number, no colour of its own
             todo = {c.card["key"]: c for c in app.query("#col-todo CardItem")}
-            assert str(todo["acme/infra#11"].query_one(".card-parent").render()) == "1 ↳ #9 Assigned but untouched"  # same repository: the number is enough
-            assert not todo["acme/charts#3"].query(".card-parent")
+            assert sorted(todo) == ["acme/charts#3", "acme/infra#9"]  # acme/infra#11 shows only inside acme/infra#9
+            assert not todo["acme/infra#9"].query(".card-parent") and not todo["acme/charts#3"].query(".card-parent")
             await pilot.press("v")
             await pilot.pause()
             rows = {r.card["key"]: r for r in app.query(tui.CardRow)}
-            assert str(rows["acme/infra#7"].query_one(".c-parent").render()) == "2 ↳ platform #2 Reliable rollouts"
+            assert str(rows["acme/infra#7"].query_one(".c-parent").content) == "↳ platform #2 Reliable rollouts"
             assert str(rows["acme/charts#3"].query_one(".c-parent").render()) == ""
-
-    asyncio.run(scenario())
-
-
-def test_tui_list_view_groups_by_parent_issue_and_the_board_does_not():
-    from tavla import tui
-
-    async def scenario():
-        app = tui.BoardApp()
-        async with app.run_test(size=(190, 45)) as pilot:
-            await app.workers.wait_for_complete()
-            await pilot.pause()
-            await pilot.press("g", "g")  # the board has two groupings
+            await pilot.press("g", "g")  # two groupings, by issue status and by session state
             await pilot.pause()
             assert app.grouping == "status"
-            await pilot.press("v", "g", "g")
-            await pilot.pause()
-            assert app.grouping == "parent" and "grouped by parent issue" in str(app.query_one("#status").render())
-            heads = [(r.group["title"], r.group["count"], str(r.query_one(".group-note").render())) for r in app.query(tui.GroupRow)]
-            assert heads == [("Reliable rollouts", 1, "2 platform #2  ☑ 1/4"), ("Assigned but untouched", 2, "1 infra #9  ☑ 0/1"), ("No parent", 1, ""), ("Unlinked", 1, "")]
-            rows = {r.card["key"]: r for r in app.query(tui.CardRow)}
-            cells = [str(lb.render()) for lb in rows["acme/infra#7"].query("Label")]
-            assert "Blocked" in cells and not any("Reliable" in c for c in cells)  # the heading names the parent, the row keeps its status
-            await pilot.press("v")  # back on the board the columns are by status again
-            await pilot.pause()
-            assert app.grouping == "status" and app.query_one("#count-blocked")
 
     asyncio.run(scenario())
-
-
-def test_tui_number_keys_filter_on_a_parent_issue():
-    from tavla import tui
-
-    async def scenario():
-        app = tui.BoardApp()
-        async with app.run_test(size=(190, 45)) as pilot:
-            await app.workers.wait_for_complete()
-            await pilot.pause()
-
-            def shown():
-                return sorted(c.card["key"] for c in app.query(tui.CardItem)), len(app.query(tui.SessItem))
-
-            everything = shown()
-            assert everything[1] == 1
-            await pilot.press("1")  # acme/infra#9, the first parent in key order
-            await pilot.pause()
-            assert shown() == (["acme/infra#11", "acme/infra#9"], 0)  # the parent's own card stays, unlinked sessions go
-            status = str(app.query_one("#status").render())
-            assert "parent 1 Assigned but untouched" in status and "2 of " in status
-            await pilot.press("2")  # another parent replaces the first
-            await pilot.pause()
-            assert shown() == (["acme/infra#7"], 0)
-            await pilot.press("v")  # the list view keeps the filter
-            await pilot.pause()
-            assert [r.card["key"] for r in app.query(tui.CardRow)] == ["acme/infra#7"]
-            await pilot.press("v", "2")  # the same key again shows everything
-            await pilot.pause()
-            assert shown() == everything and "parent" not in str(app.query_one("#status").render()).split("grouped by")[1]
-            await pilot.press("1", "escape")  # so does esc
-            await pilot.pause()
-            assert shown() == everything and app.parent_filter is None
-            await pilot.press("5")
-            await pilot.pause()
-            assert shown() == everything  # no fifth parent: nothing changes
-
-    asyncio.run(scenario())
-
-
-def test_tui_parents_on_the_board_get_distinct_colours_in_dark_and_light_themes():
-    from tavla import tui
-
-    keys = [f"acme/infra#{n}" for n in range(1, 9)]
-    tui.assign_parent_colors([{"parent": {"key": k}} for k in keys] + [{"parent": None}])
-    assert {tui.parent_color(k) for k in keys} == DARK_PARENTS
-    first = {k: tui.parent_color(k) for k in keys}
-    tui.use_palette(dark=False)
-    assert {tui.parent_color(k) for k in keys} == SOLARIZED_PARENTS
-    light = {k: tui.parent_color(k) for k in keys}
-    tui.assign_parent_colors([{"parent": {"key": k}} for k in reversed(keys)])
-    assert {k: tui.parent_color(k) for k in keys} == light  # the same set of parents gets the same colours
-    tui.use_palette(dark=True)
-    assert {k: tui.parent_color(k) for k in keys} == first
-
-
-DARK_PARENTS = {"#6cb6ff", "#f69d50", "#dcbdfb", "#57c4b8", "#f47067", "#c6d05a", "#e275ad", "#96a8f8"}
-SOLARIZED_PARENTS = {"#268bd2", "#cb4b16", "#6c71c4", "#2aa198", "#dc322f", "#b58900", "#d33682", "#859900"}
 
 
 def drawn_colour(widget, text: str) -> str | None:
@@ -2029,8 +1958,8 @@ def drawn_colour(widget, text: str) -> str | None:
     return None
 
 
-@pytest.mark.parametrize(("theme", "parents", "merged", "selected_darker"), [("tavla", DARK_PARENTS, "#a371f7", False), ("solarized-light", SOLARIZED_PARENTS, "#6c71c4", True)])
-def test_tui_parent_and_merged_colours_and_the_selected_card_suit_a_dark_or_light_theme(monkeypatch, theme, parents, merged, selected_darker):
+@pytest.mark.parametrize(("theme", "merged", "selected_darker"), [("tavla", "#a371f7", False), ("solarized-light", "#6c71c4", True)])
+def test_tui_merged_colour_and_the_selected_card_suit_a_dark_or_light_theme(lone_todo, monkeypatch, theme, merged, selected_darker):
     from textual.color import Color
 
     from tavla import tui
@@ -2043,7 +1972,6 @@ def test_tui_parent_and_merged_colours_and_the_selected_card_suit_a_dark_or_ligh
             await app.workers.wait_for_complete()
             await pilot.pause()
             cards = {c.card["key"]: c for c in app.query(tui.CardItem)}
-            assert drawn_colour(cards["acme/infra#7"].query_one(".card-parent"), "Reliable") in parents
             assert drawn_colour(cards["acme/charts#3"].query_one(".card-meta"), "⎇") == merged
             col = app.query_one("#col-todo", tui.CardList)
             col.focus()
@@ -2101,13 +2029,16 @@ def test_tui_picking_a_light_theme_with_ctrl_p_recolours_the_board_without_askin
             calls = []
             monkeypatch.setattr(core, "run", lambda *a, **k: calls.append(a))
             monkeypatch.setattr(core, "graphql", lambda *a, **k: calls.append(a))
-            await pilot.press("1")  # filter on acme/infra#9, then select its sub-issue
             col = app.query_one("#col-todo", tui.CardList)
             col.focus()
             await pilot.press("down", "down")
             await pilot.pause()
-            assert app.current_key() == "card:acme/infra#11"
-            assert drawn_colour(app.query_one("#col-todo CardItem .card-parent"), "Assigned") in DARK_PARENTS
+            assert app.current_key() == "card:acme/infra#9"
+
+            def merged():
+                return drawn_colour(next(c for c in app.query(tui.CardItem) if c.card["key"] == "acme/charts#3").query_one(".card-meta"), "⎇")
+
+            assert merged() == "#a371f7"
 
             async def until(done):
                 for _ in range(100):
@@ -2124,8 +2055,8 @@ def test_tui_picking_a_light_theme_with_ctrl_p_recolours_the_board_without_askin
             await until(lambda: str(app.screen.query_one("CommandList").get_option_at_index(0).prompt) == "solarized-light")
             await pilot.press("enter")
             await until(lambda: app.theme == "solarized-light" and app.screen.id == "_default")
-            assert drawn_colour(app.query_one("#col-todo CardItem .card-parent"), "Assigned") in SOLARIZED_PARENTS
-            assert app.parent_filter == "acme/infra#9" and app.current_key() == "card:acme/infra#11" and app.view == "board"
+            assert merged() == "#6c71c4"
+            assert app.current_key() == "card:acme/infra#9" and app.view == "board"
             assert calls == []
 
     asyncio.run(scenario())
@@ -2173,9 +2104,26 @@ def test_a_board_issue_carries_its_whole_subtree_and_its_sub_issues_are_not_boar
     assert cards["acme/infra#9"]["subtree"][1]["assignees"] == ["octocat"]
     assert cards["acme/infra#9"]["subtree"][2]["statusColumn"] == "done"
     assert {k for k, c in cards.items() if c["isBoardIssue"]} == {"acme/infra#9", "acme/infra#7", "acme/charts#3"}
-    assert not cards["acme/infra#11"]["isBoardIssue"] and cards["acme/infra#9"]["subtree"][0] is cards["acme/infra#11"]
-    # The flat list the terminal app reads is what it was: sub-issues that weren't cards don't become cards.
-    assert sorted(k for k, c in cards.items() if not c["searchOnly"]) == ["acme/charts#3", "acme/infra#11", "acme/infra#7", "acme/infra#9"]
+    assert not cards["acme/infra#9"]["subtree"][0]["isBoardIssue"]
+
+
+def test_the_board_lists_only_board_issues_and_a_session_on_a_sub_issue_is_not_unlinked(plan):
+    core.link("cccc3333", "acme/tools#42")  # three levels down
+    board = core.build_board()
+    assert sorted(c["key"] for c in board["cards"] if not c["searchOnly"]) == ["acme/charts#3", "acme/infra#7", "acme/infra#9"]
+    assert "acme/infra#20" not in [c["key"] for c in board["cards"]]  # closed and under a board issue: only inside it
+    assert "cccc3333" not in [s["id"] for s in board["unlinked"]]
+    deep = tree_card(board, "acme/infra#9", "acme/infra#40", "acme/tools#41", "acme/tools#42")
+    assert [s["id"] for s in deep["sessions"]] == ["cccc3333"]
+
+
+def tree_card(board, *keys):
+    """The card at a path of keys, from a card of the board down through the subtrees."""
+    cards = board["cards"]
+    for key in keys:
+        card = next(c for c in cards if c["key"] == key)
+        cards = card["subtree"]
+    return card
 
 
 def test_dump_indents_sub_issues_under_their_board_issue_and_json_nests_them(plan, capsys):
@@ -2190,7 +2138,7 @@ def test_dump_indents_sub_issues_under_their_board_issue_and_json_nests_them(pla
     assert core.main(["json"]) == 0
     cards = {c["key"]: c for c in json.loads(capsys.readouterr().out)["cards"]}
     assert cards["acme/infra#9"]["isBoardIssue"] and tree(cards["acme/infra#9"])[1] == ("acme/infra#40", "", [("acme/tools#41", "", [("acme/tools#42", "", [])])])
-    assert cards["acme/infra#11"]["isBoardIssue"] is False
+    assert "acme/infra#11" not in cards and cards["acme/infra#9"]["subtree"][0]["isBoardIssue"] is False  # only inside its board issue
 
 
 def test_sub_issues_github_does_not_return_are_skipped_with_a_line_in_the_errors(plan, monkeypatch):
@@ -2247,6 +2195,261 @@ def test_the_tree_costs_no_call_on_a_routine_refresh_and_is_built_from_the_cache
     monkeypatch.setattr(core, "graphql", lambda *a, **k: pytest.fail("GitHub asked while rate limited"))
     paused = core.build_board()
     assert paused["isOffline"] and trees(paused) == trees(first)
+
+
+async def select_card(app, pilot, key):
+    """Focus the board list holding the card and move its cursor there."""
+    from tavla import tui
+
+    await pilot.pause()
+    for lv in app.query(".col ListView").results(tui.CardList):
+        for i, it in enumerate(lv.children):
+            if getattr(it, "card", {}).get("key") == key:
+                lv.focus()
+                lv.index = i
+                await pilot.pause()
+                return
+    raise AssertionError(f"{key} is not on the board")
+
+
+def shown(app):
+    """The cards drawn in each board column, by column id."""
+    from tavla import tui
+
+    return {lv.id.removeprefix("col-"): [it.card["key"] if hasattr(it, "card") else it.sess["id"] for it in lv.children if not it.disabled] for lv in app.query(".col ListView").results(tui.CardList)}
+
+
+def test_tui_enter_opens_an_issue_as_a_board_of_its_sub_issues_and_esc_goes_back_up(plan):
+    from tavla import tui
+
+    async def scenario():
+        app = tui.BoardApp()
+        async with app.run_test(size=(190, 50)) as pilot:
+            await app.workers.wait_for_complete()
+            board = shown(app)
+            assert "acme/infra#9" in board["todo"] and board["unlinked"] == ["cccc3333"]
+            await select_card(app, pilot, "acme/infra#9")
+            await pilot.press("enter")
+            await pilot.pause()
+            # Its direct sub-issues in the same columns, the closed one in Done; unlinked sessions stay on the board.
+            # Sorted as the board is: the most recently updated first.
+            assert shown(app) == {"todo": ["acme/infra#40", "acme/infra#11"], "progress": [], "blocked": [], "done": ["acme/infra#20"]}
+            assert app.current_key() == "card:acme/infra#40" and app.focused is app.query_one("#col-todo")  # the first card
+            crumb = app.query_one("#crumb")
+            assert str(crumb.render()) == "acme/infra #9 Assigned but untouched"
+            await pilot.press("enter")  # one level deeper, and again
+            await pilot.pause()
+            assert shown(app)["todo"] == ["acme/tools#41"]
+            assert str(crumb.render()) == "acme/infra #9 Assigned but untouched › #40 Issue 40"  # the same repository: the number is enough
+            await pilot.press("enter")
+            await pilot.pause()
+            assert shown(app)["todo"] == ["acme/tools#42"]
+            assert str(crumb.render()) == "acme/infra #9 Assigned but untouched › #40 Issue 40 › acme/tools #41 Issue 41"
+            await pilot.press("escape")  # up a level, onto the issue left
+            await pilot.pause()
+            assert shown(app)["todo"] == ["acme/tools#41"] and app.current_key() == "card:acme/tools#41" and app.focused is app.query_one("#col-todo")
+            await pilot.press("escape", "escape")
+            await pilot.pause()
+            assert shown(app) == board and app.current_key() == "card:acme/infra#9" and app.focused.highlighted_child.card["key"] == "acme/infra#9"
+            assert not crumb.display  # the board itself has no breadcrumb
+
+    asyncio.run(scenario())
+
+
+def test_the_board_knows_your_login_and_asks_github_for_it_once(monkeypatch):
+    assert core.build_board()["viewer"] == "me" and GRAPHQL_CALLS.count("viewer") == 1
+    GRAPHQL_CALLS.clear()
+    assert core.build_board(force=True)["viewer"] == "me" and "viewer" not in GRAPHQL_CALLS  # it doesn't change: r doesn't ask again
+    (core.CONFIG / "viewer-cache.json").unlink()
+    monkeypatch.setattr(core, "graphql", lambda *a, **k: pytest.fail("GitHub asked while offline"))
+    assert core.cached_board()["viewer"] == ""  # not known yet, and not asked offline
+
+
+def test_tui_an_opened_issue_shows_every_sub_issue_and_dims_only_someone_elses(sprints, monkeypatch):
+    from tavla import tui
+
+    monkeypatch.setitem(SUB_ISSUES, "acme/infra#7", ["acme/infra#9", "acme/infra#14", "acme/infra#31", "acme/infra#40"])
+    for key, logins in {"acme/infra#9": ["me"], "acme/infra#14": ["octocat", "me"], "acme/infra#31": ["me"], "acme/infra#40": ["octocat", "hubot"]}.items():
+        monkeypatch.setitem(ASSIGNEES, key, logins)
+
+    async def scenario():
+        app = tui.BoardApp()
+        async with app.run_test(size=(190, 50)) as pilot:
+            await app.workers.wait_for_complete()
+            await select_card(app, pilot, "acme/infra#7")
+            await pilot.press("enter")
+            await pilot.pause()
+            # Outside the sprint (#9 no sprint, #14 planned) or closed long ago (#31): an opened issue shows them all.
+            cols = shown(app)
+            assert sorted(cols["todo"]) == ["acme/infra#14", "acme/infra#40", "acme/infra#9"] and cols["done"] == ["acme/infra#31"]
+            cards = {c.card["key"]: c for c in app.query(tui.CardItem)}
+            assert [k for k, c in sorted(cards.items()) if c.has_class("is-theirs")] == ["acme/infra#40"]
+            assert not any(c.has_class("is-outside") for c in cards.values())  # outside the sprint is not dimmed in here
+            assert "@octocat" in str(cards["acme/infra#40"].query_one(".card-meta").content)
+            assert "@" not in str(cards["acme/infra#14"].query_one(".card-meta").content)
+            await pilot.press("v")
+            await pilot.pause()
+            row = next(r for r in app.query(tui.CardRow) if r.card["key"] == "acme/infra#40")
+            assert row.has_class("is-theirs") and "@octocat" in str(row.query_one(".c-title").content)
+
+    asyncio.run(scenario())
+
+
+def test_tui_a_refresh_keeps_the_opened_issue_and_falls_back_to_the_nearest_level_left(plan, monkeypatch):
+    from tavla import tui
+
+    async def scenario():
+        app = tui.BoardApp()
+        async with app.run_test(size=(190, 50)) as pilot:
+            await app.workers.wait_for_complete()
+            await select_card(app, pilot, "acme/infra#9")
+            await pilot.press("enter")
+            await select_card(app, pilot, "acme/infra#40")
+            await pilot.press("enter")
+
+            async def refresh():
+                await pilot.press("r")
+                await app.workers.wait_for_complete()
+                await pilot.pause()
+                return shown(app), str(app.query_one("#crumb").render())
+
+            assert await refresh() == ({"todo": ["acme/tools#41"], "progress": [], "blocked": [], "done": []}, "acme/infra #9 Assigned but untouched › #40 Issue 40")
+            monkeypatch.setitem(SUB_ISSUES, "acme/infra#40", [])  # its only sub-issue moved elsewhere
+            app.query_one("#sessions").focus()
+            cols, crumb = await refresh()
+            assert cols["todo"] == ["acme/infra#40", "acme/infra#11"] and crumb == "acme/infra #9 Assigned but untouched"
+            assert app.focused is app.query_one("#sessions")  # a refresh doesn't move the focus out of the sessions panel
+            await select_card(app, pilot, "acme/infra#40")
+            monkeypatch.setitem(SUB_ISSUES, "acme/infra#9", [])
+            cols, _ = await refresh()
+            assert "acme/infra#9" in cols["todo"] and cols["unlinked"] == ["cccc3333"] and not app.query_one("#crumb").display
+
+    asyncio.run(scenario())
+
+
+def test_tui_inside_an_opened_issue_hide_list_view_grouping_and_card_keys_work_on_its_sub_issues(plan, monkeypatch):
+    from tavla import tui
+
+    started = []
+    monkeypatch.setattr(core, "new_session", lambda target, prompt="", title="": started.append(target) or "dddd4444")
+
+    async def scenario():
+        app = tui.BoardApp()
+        async with app.run_test(size=(190, 50)) as pilot:
+            await app.workers.wait_for_complete()
+            await select_card(app, pilot, "acme/infra#9")
+            await pilot.press("enter")
+            await select_card(app, pilot, "acme/infra#40")
+            await pilot.press("h")  # hidden at any level
+            await pilot.pause()
+            assert shown(app)["todo"] == ["acme/infra#11"] and "1 hidden" in str(app.query_one("#status").content)
+            assert "acme/infra#40" in core.load_hidden()
+            await pilot.press("H")
+            await pilot.pause()
+            assert next(c for c in app.query(tui.CardItem) if c.card["key"] == "acme/infra#40").has_class("is-hidden")
+            await pilot.press("H")
+
+            await select_card(app, pilot, "acme/infra#11")
+            await pilot.press("u")  # the status of a sub-issue
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            assert isinstance(app.screen, tui.PickStatus) and app.screen.card["key"] == "acme/infra#11"
+            await pilot.press("3")
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            assert STATUS_SETS[-1]["item"] == "PVTI_11" and shown(app)["blocked"] == ["acme/infra#11"]  # still inside acme/infra#9
+            await pilot.press("n")  # a session on a sub-issue
+            await pilot.pause()
+            await pilot.press("enter")
+            await app.workers.wait_for_complete()
+            assert started == ["https://github.com/acme/infra/issues/11"]
+
+            await pilot.press("v")  # the list shows the current level
+            await pilot.pause()
+            assert sorted(r.card["key"] for r in app.query(tui.CardRow)) == ["acme/infra#11", "acme/infra#20"] and not app.query(tui.SessRow)
+            await pilot.press("g")  # grouped by session state
+            await pilot.pause()
+            assert [r.group["title"] for r in app.query(tui.GroupRow)] == ["No session"]
+            await pilot.press("v", "escape")
+            await pilot.pause()
+            assert app.current_key() == "card:acme/infra#9" and "acme/infra#9" in shown(app)["backlog"]  # the board, by session state
+
+    asyncio.run(scenario())
+
+
+def test_tui_enter_on_a_card_only_a_search_shows_focuses_its_sessions_and_opens_nothing(monkeypatch):
+    from tavla import tui
+
+    monkeypatch.setitem(SUB_ISSUES, "acme/infra#20", ["acme/infra#90"])  # closed, so its sub-issues are not read
+
+    async def scenario():
+        app = tui.BoardApp()
+        async with app.run_test(size=(190, 50)) as pilot:
+            await app.workers.wait_for_complete()
+            await pilot.press("slash", *"rotated", "enter")
+            await pilot.pause()
+            assert app.current_key() == "card:acme/infra#20"
+            await pilot.press("enter")
+            await pilot.pause()
+            assert app.path == [] and any("No sessions on this issue" in str(n.message) for n in app._notifications)
+
+    asyncio.run(scenario())
+
+
+def test_tui_the_breadcrumb_cuts_the_titles_to_fit(plan, monkeypatch):
+    from tavla import tui
+
+    monkeypatch.setitem(TITLES, "acme/infra#40", "Move every billing endpoint over to the new invoicing API and retire the old one")
+
+    async def scenario():
+        app = tui.BoardApp()
+        async with app.run_test(size=(80, 50)) as pilot:
+            await app.workers.wait_for_complete()
+            await select_card(app, pilot, "acme/infra#9")
+            await pilot.press("enter")
+            await select_card(app, pilot, "acme/infra#40")
+            await pilot.press("enter")
+            await pilot.pause()
+            text = str(app.query_one("#crumb").render())
+            assert len(text) <= 78 and text.startswith("acme/infra #9 Assigned but untouched › #40 Move every") and text.endswith("…")
+
+    asyncio.run(scenario())
+
+
+def test_tui_enter_on_a_card_without_sub_issues_and_space_on_any_card_focus_its_sessions(plan):
+    from tavla import tui
+
+    core.link("cccc3333", "acme/infra#9")
+    core.link("cccc3333", "acme/infra#11")
+
+    async def scenario():
+        app = tui.BoardApp()
+        async with app.run_test(size=(190, 50)) as pilot:
+            await app.workers.wait_for_complete()
+            sessions = app.query_one("#sessions")
+            await select_card(app, pilot, "acme/infra#9")
+            await pilot.press("space")  # an issue with sub-issues: its own sessions
+            await pilot.pause()
+            assert app.focused is sessions and sessions.highlighted_child.sess["id"] == "cccc3333"
+            await pilot.press("escape")  # out of the sessions panel, still on the board
+            await pilot.pause()
+            assert app.current_key() == "card:acme/infra#9" and app.focused is app.query_one("#col-todo")
+            await pilot.press("enter")
+            await pilot.pause()
+            await select_card(app, pilot, "acme/infra#11")
+            await pilot.press("enter")  # no sub-issues: its sessions
+            await pilot.pause()
+            assert app.focused is sessions and sessions.highlighted_child.sess["id"] == "cccc3333"
+            await pilot.press("escape")  # the sessions panel first, then the level
+            await pilot.pause()
+            assert app.current_key() == "card:acme/infra#11" and "unlinked" not in shown(app)
+            await pilot.press("escape")
+            await pilot.pause()
+            assert "unlinked" in shown(app)
+            footer = " ".join(str(k.render()) for k in app.query("FooterKey"))
+            assert "Open" in footer and "Sessions" in footer
+
+    asyncio.run(scenario())
 
 
 def test_metadata_cached_before_sub_issues_were_read_is_fetched_again_at_once(plan):
@@ -2342,7 +2545,7 @@ def sprints(monkeypatch):
 
 
 def sprint_of(board):
-    return {c["key"]: (c["sprint"], c["searchOnly"]) for c in board["cards"]}
+    return {k: (c["sprint"], c["searchOnly"]) for k, c in every_card(board).items()}
 
 
 def test_only_issues_in_the_sprint_stay_on_the_board(sprints):
@@ -2471,7 +2674,7 @@ def test_joining_the_sprint_moves_an_issue_outside_it_planned_or_not_into_the_cu
     assert cards["acme/infra#14"] == ({"title": "Sprint 15", "state": "current"}, False) and cards["acme/infra#9"][1] is False
 
 
-def test_tui_cards_outside_the_current_sprint_carry_a_sprint_chip_warning_where_something_is_off(sprints):
+def test_tui_cards_outside_the_current_sprint_carry_a_sprint_chip_warning_where_something_is_off(sprints, lone_todo):
     from tavla import tui
 
     core.link("cccc3333", "acme/infra#14")  # planned, kept by a session
@@ -2547,25 +2750,6 @@ def test_tui_s_shows_the_issues_outside_the_sprint_dimmed_and_the_status_line_co
     asyncio.run(scenario())
 
 
-def test_tui_parent_numbers_ignore_cards_outside_the_sprint(sprints):
-    from tavla import tui
-
-    async def scenario():
-        app = tui.BoardApp()
-        async with app.run_test(size=(190, 45)) as pilot:
-            await app.workers.wait_for_complete()
-            await pilot.pause()
-            todo = {c.card["key"]: c for c in app.query("#col-todo CardItem")}
-            # The parent's own card is outside the sprint; its sub-issue still names it, and 1 filters on it.
-            assert str(todo["acme/infra#11"].query_one(".card-parent").render()) == "1 ↳ #9 Assigned but untouched"
-            await pilot.press("1")
-            await pilot.pause()
-            assert [c.card["key"] for c in app.query(tui.CardItem)] == ["acme/infra#11"]
-            assert "1 of 7 issues" in str(app.query_one("#status").content)  # 9 cards, less the two outside the sprint
-
-    asyncio.run(scenario())
-
-
 def test_tui_new_issue_is_added_to_the_current_sprint_unless_unticked(sprints, monkeypatch):
     from tavla import tui
 
@@ -2631,7 +2815,7 @@ def test_sub_issues_outside_the_sprint_are_in_the_tree_and_a_search_only_cards_s
     monkeypatch.setitem(SUB_ISSUES, "acme/infra#14", ["acme/infra#80"])  # planned: search-only
     queries = []
     monkeypatch.setattr(core, "graphql", lambda query, variables=None: queries.append(query) or fake_graphql(query, variables))
-    cards = {c["key"]: c for c in core.build_board()["cards"]}
+    cards = every_card(core.build_board())
     assert tree(cards["acme/infra#7"]) == [("acme/infra#9", "Todo", [("acme/infra#11", "Todo", [])])]
     assert cards["acme/infra#9"]["searchOnly"] and not cards["acme/infra#9"]["isBoardIssue"]
     assert not cards["acme/infra#11"]["isBoardIssue"]  # under a board issue, two levels down
