@@ -1078,7 +1078,8 @@ def _build_board(force: bool, offline: bool) -> dict:
         m = meta.get(key, {})
         # The PRs that close the issue, and those of its sessions that close no issue at all.
         loose = [p for s in ss for p in s["prs"] if p["key"] not in closes_any]
-        prs = {p["key"]: p for p in [*m.get("prs", []), *closed_by.get(key, []), *loose]}
+        closing = {p["key"]: p for p in [*m.get("prs", []), *closed_by.get(key, [])]}
+        prs = {**closing, **{p["key"]: p for p in loose}}
         return {
             "key": key,
             "url": iss["url"],
@@ -1096,6 +1097,7 @@ def _build_board(force: bool, offline: bool) -> dict:
             "sessions": ss,
             "pastSessions": [s for s in past if key in s["issues"]],
             "prs": list(prs.values()),
+            "closingPrs": list(closing.values()),
             "labels": m.get("labels", []),
             "subIssues": m.get("subIssues", {"total": 0, "completed": 0}),
             "parent": m.get("parent"),
@@ -1500,6 +1502,113 @@ def start_progress(card: dict) -> bool:
         return False
     set_status(card, "In Progress")
     return True
+
+
+def ancestors(board: dict, key: str) -> list[dict]:
+    """The cards above an issue on the board, the nearest first, up to and including its board issue."""
+
+    def path_to(cards: list[dict], above: list[dict]) -> list[dict] | None:
+        for c in cards:
+            if c["key"] == key:
+                return above
+            if (found := path_to(c["subtree"], [c, *above])) is not None:
+                return found
+        return None
+
+    return path_to(board["cards"], []) or []
+
+
+def move_ancestors(board: dict, key: str, status: str, moved: list[str] | None = None) -> tuple[list[str], list[str]]:
+    """After an issue's status was set to status: when that is In Progress, set it on each ancestor still in Todo too.
+
+    An ancestor with another status, no status or closed stays. Each moves on the project its own status
+    comes from, and its card on the board is patched. Returns the keys moved and the errors; the keys also
+    go into moved as they move, so a caller keeps the ones moved before a rate limit raised."""
+    moved = [] if moved is None else moved
+    errors: list[str] = []
+    if status.lower() != "in progress":
+        return moved, errors
+    for card in ancestors(board, key):
+        if card["statusColumn"] != "todo" or not card.get("statusItem"):
+            continue
+        try:
+            set_progress(card)
+        except RateLimited:
+            raise
+        except Exception as err:  # noqa: BLE001
+            errors.append(f"could not move {card['key']} to In Progress: {err}")
+            continue
+        moved.append(card["key"])
+    return moved, errors
+
+
+def set_progress(card: dict) -> None:
+    """Set a card's status to In Progress on GitHub and on the card itself, so the board shows it at once."""
+    name = set_status(card, "In Progress")
+    card["status"], card["statusColumn"] = name, status_column_of(name, True)
+
+
+def load_moved() -> set[str]:
+    """The issues move_issues_with_open_prs has moved to In Progress, each moved only once."""
+    try:
+        return set(json.loads((CONFIG / "moved.json").read_text()))
+    except FileNotFoundError, json.JSONDecodeError:
+        return set()
+
+
+def move_issues_with_open_prs(board: dict) -> list[str]:
+    """Move each open issue of mine in Todo with an open PR that closes it (a draft counts) to In Progress, with its ancestors in Todo.
+
+    Called by the app after a refresh, never by build_board, so printing the board writes nothing. Each issue
+    is moved only once, recorded in moved.json after its move succeeded, so a move back to Todo sticks.
+    Nothing is sent while GitHub calls are paused; a failed move goes to board["errors"] and is tried
+    again at the next refresh. The board's cards are patched, so it shows the moves at once. Returns the keys moved."""
+    viewer = (board.get("viewer") or "").lower()
+    if not viewer or board.get("isOffline") or backoff_until() > time.time():
+        return []
+    done = load_moved()
+    cards = list({c["key"]: c for c in iter_cards(board["cards"])}.values())
+    candidates = [
+        c
+        for c in cards
+        if c["key"] not in done
+        and c["isOpen"]
+        and c["statusColumn"] == "todo"
+        and c.get("statusItem")
+        and viewer in (a.lower() for a in c.get("assignees") or [])
+        and any(p["state"] == "OPEN" for p in c.get("closingPrs") or [])
+    ]
+    moved: list[str] = []
+    failed: list[str] = []
+    for card in candidates:
+        up: list[str] = []
+        try:
+            # The ancestors go first: a pause before the issue's own move leaves it in Todo, so the next refresh retries it and them.
+            _, errors = move_ancestors(board, card["key"], "In Progress", up)
+            failed += errors
+            if card["statusColumn"] == "todo":  # else it went along as an earlier candidate's ancestor
+                set_progress(card)
+                moved.append(card["key"])
+            done.add(card["key"])
+            CONFIG.mkdir(parents=True, exist_ok=True)
+            (CONFIG / "moved.json").write_text(json.dumps(sorted(done), indent=2) + "\n")
+        except RateLimited:
+            start_backoff()
+            break
+        except Exception as err:  # noqa: BLE001
+            failed.append(f"could not move {card['key']} to In Progress: {err}")
+            continue
+        finally:
+            moved += up
+    board["errors"][:0] = failed  # first, where the status line shows them
+    return moved
+
+
+def iter_cards(cards: list[dict]):
+    """Every card of a list and of their subtrees."""
+    for c in cards:
+        yield c
+        yield from iter_cards(c["subtree"])
 
 
 def first_error(body: dict) -> str:
