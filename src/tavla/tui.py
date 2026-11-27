@@ -102,9 +102,9 @@ def has_sprints() -> bool:
 
 
 def sprint_chip(card: dict) -> str:
-    """The sprint of a card not in the current sprint, in the warning colour where something is off: a leftover, or started work with no sprint."""
+    """The sprint of a card not in the current sprint nor covered by it, in the warning colour where something is off: a leftover, or started work with no sprint."""
     sprint = card.get("sprint")
-    if not sprint or sprint["state"] == "current":
+    if not sprint or sprint["state"] in ("current", "covered"):
         return ""
     started = card["statusColumn"] in ("progress", "blocked", "done")
     warn = sprint["state"] == "leftover" or (sprint["state"] == "none" and started)
@@ -568,24 +568,33 @@ class AskPrompt(ModalScreen[tuple[str, bool, bool] | None]):
 class NewIssue(ModalScreen[dict | None]):
     """Repo, title, optional body and assignment for a new issue; enter in the title or ctrl+s creates it.
 
-    With sprint, the current sprint of the first sprint project, it also offers to add the issue to that sprint (ticked)."""
+    With sprint, the current sprint of the first sprint project, it also offers to add the issue to that sprint (ticked).
+    With parent, the opened issue, it files a sub-issue of it: the parent's repository is the default, listed first when
+    it is not one of the issue_repos, and there is no sprint box, since the parent's sprint covers it."""
 
     BINDINGS: ClassVar[list[BindingType]] = [Binding("escape", "cancel", "Cancel"), Binding("ctrl+s", "create", "Create", priority=True)]
     AUTO_FOCUS = "#issue-title"
 
-    def __init__(self, sprint: str = "") -> None:
+    def __init__(self, sprint: str = "", parent: dict | None = None) -> None:
         super().__init__()
-        self.sprint = sprint
+        self.sprint, self.parent_card = sprint, parent
+        self.repos, self.default = list(core.ISSUE_REPOS), 0
+        if parent:
+            here = parent["key"].split("#")[0]
+            self.default = next((i for i, (repo, _) in enumerate(self.repos) if repo.lower() == here), -1)
+            if self.default < 0:
+                self.repos, self.default = [(here, "Parent"), *self.repos], 0
 
     def compose(self) -> ComposeResult:
+        what = f"New sub-issue of {escape(self.parent_card['key'])} {escape(fit(self.parent_card['title'], 60))}" if self.parent_card else "New issue"
         with Vertical(id="ask"):
-            yield Label("New issue  [$text-muted]enter or ctrl+s creates · ctrl+g in the body opens an editor · esc cancels[/]")
+            yield Label(f"{what}  [$text-muted]enter or ctrl+s creates · ctrl+g in the body opens an editor · esc cancels[/]")
             with RadioSet(id="issue-repo"):
-                for i, (repo, label) in enumerate(core.ISSUE_REPOS):
-                    yield RadioButton(f"{label}  [$text-muted]{repo}[/]", value=i == 0)
+                for i, (repo, label) in enumerate(self.repos):
+                    yield RadioButton(f"{label}  [$text-muted]{repo}[/]", value=i == self.default)
             yield WordInput(placeholder="title", id="issue-title")
             yield PromptArea(id="issue-body", placeholder="body (optional)")
-            yield Checkbox("Assign to me, so it shows on the board", value=True, id="issue-assign")
+            yield Checkbox("Assign to me" if self.parent_card else "Assign to me, so it shows on the board", value=True, id="issue-assign")
             if self.sprint:
                 yield Checkbox(f"Add to {escape(self.sprint)}", value=True, id="issue-sprint")
 
@@ -599,10 +608,11 @@ class NewIssue(ModalScreen[dict | None]):
             self.notify("An issue needs a title.", severity="error")
             self.query_one("#issue-title", Input).focus()
             return
-        repo = core.ISSUE_REPOS[self.query_one("#issue-repo", RadioSet).pressed_index][0]
+        repo = self.repos[self.query_one("#issue-repo", RadioSet).pressed_index][0]
         body = self.query_one("#issue-body", TextArea).text
         sprint = bool(self.sprint) and self.query_one("#issue-sprint", Checkbox).value
-        self.dismiss({"repo": repo, "title": title, "body": body, "assign": self.query_one("#issue-assign", Checkbox).value, "sprint": sprint})
+        assign = self.query_one("#issue-assign", Checkbox).value
+        self.dismiss({"repo": repo, "title": title, "body": body, "assign": assign, "sprint": sprint, "parent": self.parent_card})
 
     def action_cancel(self) -> None:
         self.dismiss(None)
@@ -1449,14 +1459,17 @@ class BoardApp(App):
                 self.call_from_thread(self.notify, f"Could not attach: {err}", severity="error")
 
     def action_new_issue(self) -> None:
-        if not core.ISSUE_REPOS:
-            self.notify(f"No repository to file issues in: add an [[issue_repos]] entry to {core.CONFIG / 'config.toml'}.", severity="warning", timeout=10)
-            return
-
         def go(spec: dict | None) -> None:
             if spec:
                 self.create_issue(spec)
 
+        # Inside an opened issue, a sub-issue of it, which its sprint covers.
+        if self.path and (opened := self.opened()):
+            self.push_screen(NewIssue(parent=opened[-1]), go)
+            return
+        if not core.ISSUE_REPOS:
+            self.notify(f"No repository to file issues in: add an [[issue_repos]] entry to {core.CONFIG / 'config.toml'}.", severity="warning", timeout=10)
+            return
         first = core.first_sprint_project()
         self.push_screen(NewIssue(core.current_sprint_title(self.data, core.project_id(first)) if first else ""), go)
 
@@ -1472,6 +1485,11 @@ class BoardApp(App):
                 core.add_to_sprint(issue)
             except Exception as err:  # noqa: BLE001
                 self.call_from_thread(self.notify, f"Created {issue['key']}, but could not add it to the sprint: {err}", severity="error", timeout=15)
+        if spec.get("parent"):
+            try:
+                core.make_sub_issue(spec["parent"], issue)
+            except Exception as err:  # noqa: BLE001
+                self.call_from_thread(self.notify, f"Created {issue['url']}, but {err}", severity="error", timeout=15)
         self.call_from_thread(self.issue_created, issue)
 
     def issue_created(self, issue: dict) -> None:
