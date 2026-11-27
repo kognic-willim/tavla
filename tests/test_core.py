@@ -92,6 +92,13 @@ def parent_node(repo, number, title, total=0, completed=0):
 
 # The flaky deploy belongs to an epic that has no card; the personal todo is a sub-issue of another card.
 PARENTS = {"acme/infra#7": parent_node("acme/platform", 2, "Reliable rollouts", 4, 1), "acme/infra#11": parent_node("acme/infra", 9, "Assigned but untouched", 1, 0)}
+# Each issue's sub-issues as GitHub lists them; None is one GitHub returns as null (no access), "omitted" one it counts but leaves out.
+SUB_ISSUES: dict[str, list[str | None]] = {"acme/infra#9": ["acme/infra#11"]}
+# Pull requests and the issues they close; any other ref is an issue.
+PULLS: dict[str, dict] = {"acme/charts#40": {"state": "MERGED", "closes": ["acme/charts#3"]}}
+TITLES = {"acme/infra#7": "Deploy is flaky", "acme/charts#3": "Upgrade chart"}
+ASSIGNEES: dict[str, list[str]] = {}
+UNREADABLE: set[str] = set()  # refs GitHub answers null for: deleted, or no access
 
 
 def fake_graphql(query, variables=None):
@@ -131,33 +138,48 @@ def fake_graphql(query, variables=None):
         return {"data": {"repositoryOwner": {"projectV2": project}}}
     GRAPHQL_CALLS.append("refs")
     data = {}
-    for alias, owner, repo, num in re.findall(r'(r\d+): repository\(owner: "([^"]+)", name: "([^"]+)"\) \{ issueOrPullRequest\(number: (\d+)', query):
+    closes_read = int(m[1]) if (m := re.search(r"closingIssuesReferences\(first: (\d+)\)", query)) else 0
 
-        def issue(n, t, r=f"{owner}/{repo}"):
-            rich = n == 7
-            return {
-                "__typename": "Issue", "number": n, "title": t, "body": "Fails **twice** a day." if rich else "", "url": f"https://github.com/{r}/issues/{n}", "state": "CLOSED" if f"{r}#{n}" in CLOSED else "OPEN", "updatedAt": NOW,
-                "repository": {"nameWithOwner": r},
+    def issue(key, direct):
+        r, n = key.split("#")[0], int(key.split("#")[1])
+        rich = n == 7
+        node = {
+            "__typename": "Issue", "number": n, "title": TITLES.get(key, f"Issue {n}"), "body": "Fails **twice** a day." if rich else "", "url": f"https://github.com/{r}/issues/{n}", "state": "CLOSED" if key in CLOSED else "OPEN", "updatedAt": NOW,
+            "repository": {"nameWithOwner": r},
+            "subIssuesSummary": {"total": 3 if rich else 0, "completed": 1 if rich else 0},
+            "parent": PARENTS.get(key),
+        }  # fmt: skip
+        if direct:  # a PR's closing list reads the issues' own fields only
+            subs = SUB_ISSUES.get(key, [])
+            node |= {
                 "labels": {"nodes": [{"name": "bug [p1]", "color": "d73a4a"}] if rich else []},
-                "subIssuesSummary": {"total": 3 if rich else 0, "completed": 1 if rich else 0},
-                "assignees": {"nodes": []},
-                "parent": PARENTS.get(f"{r}#{n}"),
+                "assignees": {"nodes": [{"login": a} for a in ASSIGNEES.get(key, [])]},
                 "closedByPullRequestsReferences": {"nodes": [{"number": 50, "state": "OPEN", "url": f"https://github.com/{r}/pull/50", "repository": {"nameWithOwner": r}}] if rich else []},
-            }  # fmt: skip
+                "subIssues": {
+                    "totalCount": len(subs),
+                    "nodes": [None if s is None else {"number": int(s.split("#")[1]), "repository": {"nameWithOwner": s.split("#")[0]}} for s in subs[:100] if s != "omitted"],
+                },
+            }
+        return node
 
-        if repo == "charts":
+    for alias, owner, repo, num in re.findall(r'(r\d+): repository\(owner: "([^"]+)", name: "([^"]+)"\) \{ issueOrPullRequest\(number: (\d+)', query):
+        key = f"{owner}/{repo}#{num}"
+        if key in UNREADABLE:
+            data[alias] = {"issueOrPullRequest": None}
+        elif key in PULLS:
+            pr = PULLS[key]
             data[alias] = {
                 "issueOrPullRequest": {
                     "__typename": "PullRequest",
-                    "number": 40,
-                    "state": "MERGED",
-                    "url": "https://github.com/acme/charts/pull/40",
-                    "repository": {"nameWithOwner": "acme/charts"},
-                    "closingIssuesReferences": {"nodes": [issue(3, "Upgrade chart", "acme/charts")]},
+                    "number": int(num),
+                    "state": pr["state"],
+                    "url": f"https://github.com/{owner}/{repo}/pull/{num}",
+                    "repository": {"nameWithOwner": f"{owner}/{repo}"},
+                    "closingIssuesReferences": {"nodes": [issue(k, direct=False) for k in pr["closes"][:closes_read]]},
                 }
             }
         else:
-            data[alias] = {"issueOrPullRequest": issue(int(num), "Deploy is flaky" if num == "7" else f"Issue {num}")}
+            data[alias] = {"issueOrPullRequest": issue(key, direct=True)}
     return {"data": data}
 
 
@@ -189,12 +211,14 @@ def env(tmp_path, monkeypatch):
     SPRINT_WRITES.clear()
     SPRINT_FIELDS.clear()
     RESUMED.clear()
+    UNREADABLE.clear()
 
 
 def test_routine_refresh_reads_github_metadata_from_cache():
     core.build_board()
     first = list(GRAPHQL_CALLS)
-    assert first.count("refs") == 1 and {"search", "project team", "project me", "project extra"} <= set(first)
+    # The second lookup is acme/charts#3, known only from PR 40's closing list, which reads no sub-issues.
+    assert first.count("refs") == 2 and {"search", "project team", "project me", "project extra"} <= set(first)
     assert first.count("search closed") == 1 and [c for c in first if c.startswith("closed project")] == ["closed project me"]  # backlog projects only
     GRAPHQL_CALLS.clear()
     core.build_board()
@@ -358,8 +382,8 @@ def test_graphql_detects_rate_limits_from_errors_not_from_data(monkeypatch):
 def test_groups_by_issue_status_with_session_badges():
     text = core.summary(core.build_board(), "status")
     # Not-started statuses (todo, backlog, none) share Todo; Blocked keeps its own column after In Progress.
-    assert "## Todo (3)\n- acme/charts#3 Upgrade chart [~ 1s/1 live]" in text
-    assert "- acme/infra#11 Personal todo" in text and "- acme/infra#9 Assigned but untouched" in text
+    assert "## Todo (2)\n- acme/charts#3 Upgrade chart [~ 1s/1 live]" in text
+    assert "\n- acme/infra#9 Assigned but untouched\n  - acme/infra#11 Personal todo [Todo]\n" in text  # a sub-issue sits under its board issue
     assert "## In Progress (0)\n## Blocked (1)\n- acme/infra#7 Deploy is flaky [! 1s/1 live]\n  - aaaa1111" in text
     assert "## Done (0)" in text and "Finished thing" not in text
     cards = {c["key"]: c for c in core.build_board()["cards"]}
@@ -385,7 +409,7 @@ def test_groups_by_session_state():
     # Needs-you and working share Active, needs-you first.
     assert "## Active (2)\n- acme/infra#7 Deploy is flaky [Blocked]\n  - aaaa1111 blocked" in text
     assert "\n- acme/charts#3 Upgrade chart\n  - bbbb2222 working" in text.split("## Idle")[0]
-    assert "## No session (2)" in text
+    assert "## No session (1)\n- acme/infra#9 Assigned but untouched\n  - acme/infra#11 Personal todo [Todo]" in text
 
 
 def test_link_moves_session_onto_issue_and_unlink_moves_it_back():
@@ -2121,6 +2145,171 @@ def test_metadata_cached_without_a_parent_is_fetched_again_at_once():
     assert "refs" not in GRAPHQL_CALLS  # and then it is cached like the rest
 
 
+# --- sub-issues ------------------------------------------------------------------
+
+
+def tree(card):
+    """A card's subtree as (key, status, [subtree]) for comparing."""
+    return [(c["key"], c["status"], tree(c)) for c in card["subtree"]]
+
+
+@pytest.fixture
+def plan(monkeypatch):
+    """acme/infra#9 is a plan three levels deep: someone else's task, a closed one, and one in another repository."""
+    monkeypatch.setitem(SUB_ISSUES, "acme/infra#9", ["acme/infra#11", "acme/infra#40", "acme/infra#20"])
+    monkeypatch.setitem(SUB_ISSUES, "acme/infra#40", ["acme/tools#41"])
+    monkeypatch.setitem(SUB_ISSUES, "acme/tools#41", ["acme/tools#42"])
+    monkeypatch.setitem(ASSIGNEES, "acme/infra#40", ["octocat"])
+
+
+def test_a_board_issue_carries_its_whole_subtree_and_its_sub_issues_are_not_board_issues(plan):
+    board = core.build_board()
+    cards = {c["key"]: c for c in board["cards"]}
+    assert tree(cards["acme/infra#9"]) == [
+        ("acme/infra#11", "Todo", []),  # mine and on the board too
+        ("acme/infra#40", "", [("acme/tools#41", "", [("acme/tools#42", "", [])])]),  # someone else's, in another repository, three levels down
+        ("acme/infra#20", "Closed", []),
+    ]
+    assert cards["acme/infra#9"]["subtree"][1]["assignees"] == ["octocat"]
+    assert cards["acme/infra#9"]["subtree"][2]["statusColumn"] == "done"
+    assert {k for k, c in cards.items() if c["isBoardIssue"]} == {"acme/infra#9", "acme/infra#7", "acme/charts#3"}
+    assert not cards["acme/infra#11"]["isBoardIssue"] and cards["acme/infra#9"]["subtree"][0] is cards["acme/infra#11"]
+    # The flat list the terminal app reads is what it was: sub-issues that weren't cards don't become cards.
+    assert sorted(k for k, c in cards.items() if not c["searchOnly"]) == ["acme/charts#3", "acme/infra#11", "acme/infra#7", "acme/infra#9"]
+
+
+def test_dump_indents_sub_issues_under_their_board_issue_and_json_nests_them(plan, capsys):
+    assert core.main(["dump"]) == 0
+    out = capsys.readouterr().out
+    assert "## Todo (2)\n- acme/charts#3 Upgrade chart [~ 1s/1 live]\n  - bbbb2222 working" in out
+    assert (
+        "\n- acme/infra#9 Assigned but untouched\n  - acme/infra#11 Personal todo [Todo]\n  - acme/infra#40 Issue 40\n    - acme/tools#41 Issue 41\n      - acme/tools#42 Issue 42\n  - acme/infra#20 Rotated the key [Closed]\n"
+        in out
+    )
+    assert "\n- acme/infra#11" not in out  # only inside its board issue
+    assert core.main(["json"]) == 0
+    cards = {c["key"]: c for c in json.loads(capsys.readouterr().out)["cards"]}
+    assert cards["acme/infra#9"]["isBoardIssue"] and tree(cards["acme/infra#9"])[1] == ("acme/infra#40", "", [("acme/tools#41", "", [("acme/tools#42", "", [])])])
+    assert cards["acme/infra#11"]["isBoardIssue"] is False
+
+
+def test_sub_issues_github_does_not_return_are_skipped_with_a_line_in_the_errors(plan, monkeypatch):
+    monkeypatch.setitem(SUB_ISSUES, "acme/infra#40", ["acme/tools#41", None, "omitted", "acme/tools#43"])  # two hidden from me, one deleted
+    UNREADABLE.add("acme/tools#43")
+    monkeypatch.setitem(SUB_ISSUES, "acme/tools#42", [f"acme/tools#{n}" for n in range(100, 201)])  # one more than a page
+    board = core.build_board()
+    deep = board["cards"][[c["key"] for c in board["cards"]].index("acme/infra#9")]["subtree"][1]
+    assert [c["key"] for c in deep["subtree"]] == ["acme/tools#41"]
+    assert len(deep["subtree"][0]["subtree"][0]["subtree"]) == 100
+    expected = [
+        "acme/infra#40: 2 sub-issue(s) not readable, skipped",
+        "acme/tools#43: sub-issue of acme/infra#40 not readable, skipped",
+        "acme/tools#42: only the first 100 sub-issues are read, 1 more are not shown",
+    ]
+    assert [e for e in board["errors"] if "sub-issue" in e] == expected
+    GRAPHQL_CALLS.clear()
+    again = core.build_board()  # from the cache: no call, and the same lines
+    assert GRAPHQL_CALLS == [] and [e for e in again["errors"] if "sub-issue" in e] == expected
+
+
+def test_the_tree_stops_at_githubs_eight_levels_and_never_nests_an_issue_inside_itself(monkeypatch, capsys):
+    chain = [f"acme/deep#{n}" for n in range(1, 11)]  # deeper than GitHub allows, as a stale cache could make it look
+    for parent, sub in zip(["acme/infra#9", *chain], chain):
+        monkeypatch.setitem(SUB_ISSUES, parent, [sub])
+    monkeypatch.setitem(SUB_ISSUES, "acme/infra#7", ["acme/loop#1"])
+    monkeypatch.setitem(SUB_ISSUES, "acme/loop#1", ["acme/loop#2"])
+    monkeypatch.setitem(SUB_ISSUES, "acme/loop#2", ["acme/loop#1"])  # two issues listing each other
+    queries = []
+    monkeypatch.setattr(core, "graphql", lambda query, variables=None: queries.append(query) or fake_graphql(query, variables))
+    assert core.main(["json"]) == 0  # nothing nests in itself, or the JSON could not be written
+    cards = {c["key"]: c for c in json.loads(capsys.readouterr().out)["cards"]}
+    assert tree(cards["acme/infra#7"]) == [("acme/loop#1", "", [("acme/loop#2", "", [])])]
+    level, depth = cards["acme/infra#9"], 0
+    while level["subtree"] and level["subtree"][-1]["key"].startswith("acme/deep"):
+        level, depth = level["subtree"][-1], depth + 1
+    assert (level["key"], depth) == ("acme/deep#8", 8)
+    asked = " ".join(queries)
+    assert 'name: "deep") { issueOrPullRequest(number: 8)' in asked and 'name: "deep") { issueOrPullRequest(number: 9)' not in asked
+
+
+def test_the_tree_costs_no_call_on_a_routine_refresh_and_is_built_from_the_cache_when_github_is_out(plan, monkeypatch):
+    first = core.build_board()
+    GRAPHQL_CALLS.clear()
+    warm = core.build_board()
+    assert GRAPHQL_CALLS == []  # the subtree adds no call to a routine refresh
+
+    def trees(board):
+        return {c["key"]: tree(c) for c in board["cards"]}, {c["key"] for c in board["cards"] if c["isBoardIssue"]}
+
+    assert trees(warm) == trees(first)
+    assert trees(core.cached_board()) == trees(first)  # at startup
+    (core.CONFIG / "backoff.json").write_text(json.dumps({"until": 4_000_000_000}))
+    monkeypatch.setattr(core, "graphql", lambda *a, **k: pytest.fail("GitHub asked while rate limited"))
+    paused = core.build_board()
+    assert paused["isOffline"] and trees(paused) == trees(first)
+
+
+def test_metadata_cached_before_sub_issues_were_read_is_fetched_again_at_once(plan):
+    core.build_board()
+    cache_file = core.CONFIG / "meta-cache.json"
+    cache = json.loads(cache_file.read_text())
+    for entry in cache.values():  # as the version before this one wrote it
+        info = entry["info"] or {}
+        info.pop("subIssueKeys", None), info.pop("subIssuesUnread", None), info.pop("closesRead", None)
+    cache_file.write_text(json.dumps(cache))
+    GRAPHQL_CALLS.clear()
+    board = core.build_board()
+    assert "refs" in GRAPHQL_CALLS and len(tree(next(c for c in board["cards"] if c["key"] == "acme/infra#9"))) == 3
+    GRAPHQL_CALLS.clear()
+    core.build_board()
+    assert GRAPHQL_CALLS == []  # and then it is cached like the rest
+
+
+@pytest.fixture
+def stack(monkeypatch):
+    """One session with stacked PRs: 60 closes acme/infra#61, 62 closes acme/infra#63, 64 closes nothing."""
+    job = core.JOBS / "ffff6666"
+    job.mkdir()
+    prs = [{"kind": "pr", "href": f"https://github.com/acme/infra/pull/{n}"} for n in (60, 62, 64)]
+    (job / "state.json").write_text(json.dumps({"name": "stacked work", "state": "working", "intent": "build it", "children": prs, "updatedAt": NOW}))
+    monkeypatch.setitem(PULLS, "acme/infra#60", {"state": "OPEN", "closes": ["acme/infra#61"]})
+    monkeypatch.setitem(PULLS, "acme/infra#62", {"state": "OPEN", "closes": ["acme/infra#63"]})
+    monkeypatch.setitem(PULLS, "acme/infra#64", {"state": "OPEN", "closes": []})
+
+
+def test_a_card_counts_the_prs_that_close_it_and_its_sessions_prs_that_close_nothing(stack):
+    cards = {c["key"]: c for c in core.build_board()["cards"]}
+    assert [p["key"] for p in cards["acme/infra#61"]["prs"]] == ["acme/infra#60", "acme/infra#64"]
+    assert [p["key"] for p in cards["acme/infra#63"]["prs"]] == ["acme/infra#62", "acme/infra#64"]
+    assert [p["key"] for p in cards["acme/charts#3"]["prs"]] == ["acme/charts#40"]
+
+
+def test_tui_a_card_counts_only_the_prs_that_close_it_and_the_sessions_prs_that_close_nothing(stack):
+    from tavla import tui
+
+    async def scenario():
+        app = tui.BoardApp()
+        async with app.run_test(size=(190, 50)) as pilot:
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            meta = {it.card["key"]: "".join(str(lb.content) for lb in it.query(".card-meta")) for it in app.query(tui.CardItem)}
+            assert "⎇ 2 PRs" in meta["acme/infra#61"] and "⎇ 2 PRs" in meta["acme/infra#63"]  # its own and the one closing nothing, not all three
+
+    asyncio.run(scenario())
+
+
+def test_a_pr_that_closes_more_than_five_issues_links_its_session_to_all_of_them(monkeypatch):
+    closes = [f"acme/infra#{n}" for n in range(70, 77)]
+    monkeypatch.setitem(PULLS, "acme/charts#40", {"state": "MERGED", "closes": closes})
+    queries = []
+    monkeypatch.setattr(core, "graphql", lambda query, variables=None: queries.append(query) or fake_graphql(query, variables))
+    board = core.build_board()
+    assert sorted(c["key"] for c in board["cards"] if any(s["id"] == "bbbb2222" for s in c["sessions"])) == closes
+    # Only an issue's own lookup reads its sub-issues: a PR's closing list stays slim, so reading 20 costs little.
+    pr_fragment = next(q for q in queries if "closingIssuesReferences" in q).split("closingIssuesReferences(first: 20)")[1].split("\n")[0]
+    assert "subIssues(" not in pr_fragment and "labels(" not in pr_fragment
+
+
 # --- sprints ---------------------------------------------------------------------
 
 S14 = {"id": "it14", "title": "Sprint 14", "startDate": "2026-02-23", "duration": 14}
@@ -2435,6 +2624,26 @@ def test_tui_starting_work_on_an_issue_outside_the_sprint_moves_it_into_the_spri
             assert SPRINT_WRITES == [("iteration", {"project": "PVT_team", "item": "PVTI_9", "field": "PVTIF_sprint", "iteration": "it15"})]
 
     asyncio.run(scenario())
+
+
+def test_sub_issues_outside_the_sprint_are_in_the_tree_and_a_search_only_cards_subtree_is_not_read(sprints, monkeypatch):
+    monkeypatch.setitem(SUB_ISSUES, "acme/infra#7", ["acme/infra#9"])  # no sprint, under a board issue in the sprint
+    monkeypatch.setitem(SUB_ISSUES, "acme/infra#14", ["acme/infra#80"])  # planned: search-only
+    queries = []
+    monkeypatch.setattr(core, "graphql", lambda query, variables=None: queries.append(query) or fake_graphql(query, variables))
+    cards = {c["key"]: c for c in core.build_board()["cards"]}
+    assert tree(cards["acme/infra#7"]) == [("acme/infra#9", "Todo", [("acme/infra#11", "Todo", [])])]
+    assert cards["acme/infra#9"]["searchOnly"] and not cards["acme/infra#9"]["isBoardIssue"]
+    assert not cards["acme/infra#11"]["isBoardIssue"]  # under a board issue, two levels down
+    assert cards["acme/infra#14"]["subtree"] == [] and not cards["acme/infra#14"]["isBoardIssue"]
+    assert not any("issueOrPullRequest(number: 80)" in q for q in queries)
+
+
+def test_an_issue_with_a_session_whose_parent_is_outside_the_sprint_is_a_board_issue(sprints):
+    core.link("cccc3333", "acme/infra#11")  # its parent acme/infra#9 is mine but outside the sprint
+    cards = {c["key"]: c for c in core.build_board()["cards"]}
+    assert cards["acme/infra#11"]["isBoardIssue"] and not cards["acme/infra#9"]["isBoardIssue"]
+    assert cards["acme/infra#7"]["isBoardIssue"] and cards["acme/charts#3"]["isBoardIssue"]  # a session, and no candidate above
 
 
 def test_tui_without_a_sprint_project_has_no_sprint_cell_and_s_says_which_key_to_add():
