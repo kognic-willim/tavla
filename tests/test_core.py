@@ -2141,6 +2141,153 @@ def test_dump_indents_sub_issues_under_their_board_issue_and_json_nests_them(pla
     assert "acme/infra#11" not in cards and cards["acme/infra#9"]["subtree"][0]["isBoardIssue"] is False  # only inside its board issue
 
 
+def add_job(jid, state):
+    (core.JOBS / jid).mkdir()
+    (core.JOBS / jid / "state.json").write_text(json.dumps({"updatedAt": NOW, **state}))
+
+
+@pytest.fixture
+def deep_work(plan, monkeypatch):
+    """A session that needs you, three levels under acme/infra#9, with one PR closing two of the sub-issues it works on."""
+    monkeypatch.setitem(PULLS, "acme/tools#60", {"state": "OPEN", "closes": ["acme/tools#41", "acme/tools#42"]})
+    add_job("gggg7777", {"name": "deep work", "state": "needs_input", "intent": "go", "children": [{"kind": "pr", "href": "https://github.com/acme/tools/pull/60"}]})
+
+
+def test_a_card_rolls_up_the_sessions_prs_and_done_count_of_its_whole_subtree(deep_work, capsys):
+    core.link("cccc3333", "acme/infra#9")
+    core.link("cccc3333", "acme/tools#42")  # on the issue and on one in its subtree
+    board = core.build_board()
+    nine = tree_card(board, "acme/infra#9")
+    forty, forty_one = tree_card(board, "acme/infra#9", "acme/infra#40"), tree_card(board, "acme/infra#9", "acme/infra#40", "acme/tools#41")
+    assert [c["rollup"]["sessionColumn"] for c in (nine, forty, forty_one)] == ["needs", "needs", "needs"]
+    assert [s["id"] for s in nine["sessions"]] == ["cccc3333"] and nine["sessionColumn"] == "idle"  # its own sessions stay its own
+    assert nine["rollup"]["sessions"] == ["cccc3333", "gggg7777"]  # direct first, each once
+    assert [p["key"] for p in nine["rollup"]["prs"]] == [p["key"] for p in forty["rollup"]["prs"]] == ["acme/tools#60"]  # closes two, counted once
+    # Every issue in the subtree: #11, #40, #41, #42 and the closed #20.
+    assert nine["rollup"]["subIssues"] == {"total": 5, "completed": 1} and forty["rollup"]["subIssues"] == {"total": 2, "completed": 0}
+    assert core.main(["dump"]) == 0
+    assert "\n- acme/infra#9 Issue 9 [! 2s/1 live]\n  - cccc3333 done" in capsys.readouterr().out
+    assert "\n- acme/infra#9 Issue 9" in core.summary(board, "session").split("## Idle")[0]  # Active by the session under it
+    assert core.main(["json"]) == 0
+    card = next(c for c in json.loads(capsys.readouterr().out)["cards"] if c["key"] == "acme/infra#9")
+    assert [s["id"] for s in card["sessions"]] == ["cccc3333"] and card["rollup"]["sessions"] == ["cccc3333", "gggg7777"]
+
+
+def test_a_hidden_sub_issue_leaves_the_session_and_pr_roll_up_and_still_counts_as_done_or_not(deep_work):
+    core.toggle_hidden("acme/tools#41")  # and with it #42 below
+    board = core.build_board()
+    nine, forty = tree_card(board, "acme/infra#9"), tree_card(board, "acme/infra#9", "acme/infra#40")
+    assert (nine["rollup"]["sessionColumn"], nine["rollup"]["sessions"], nine["rollup"]["prs"]) == ("backlog", [], [])
+    assert (forty["rollup"]["sessionColumn"], forty["rollup"]["prs"]) == ("backlog", [])
+    assert nine["rollup"]["subIssues"] == {"total": 5, "completed": 1}
+    assert tree_card(board, "acme/infra#9", "acme/infra#40", "acme/tools#41")["rollup"]["sessionColumn"] == "needs"  # its own still says so
+
+
+def test_a_finished_board_issue_stays_on_the_board_while_a_session_in_its_subtree_is_live(monkeypatch):
+    # The closed acme/infra#20 has a task with a step under it, and the step has a session that needs you.
+    monkeypatch.setitem(SUB_ISSUES, "acme/infra#20", ["acme/infra#33"])
+    monkeypatch.setitem(SUB_ISSUES, "acme/infra#33", ["acme/infra#34"])
+    monkeypatch.setitem(PARENTS, "acme/infra#33", parent_node("acme/infra", 20, "Rotated the key"))
+    monkeypatch.setitem(PARENTS, "acme/infra#34", parent_node("acme/infra", 33, "Rotate it"))
+    core.link("cccc3333", "acme/infra#34")
+    board = core.build_board()
+    cards = {c["key"]: c for c in board["cards"]}
+    assert not cards["acme/infra#20"]["searchOnly"] and cards["acme/infra#20"]["isBoardIssue"] and "acme/infra#34" not in cards
+    assert [s["id"] for s in tree_card(board, "acme/infra#20", "acme/infra#33", "acme/infra#34")["sessions"]] == ["cccc3333"]
+    assert "## Done (1)\n- acme/infra#20 Rotated the key [1s]" in core.summary(board, "status")
+    assert {k for k, c in cards.items() if c["searchOnly"]} == {"me/todo#5"}  # a finished issue with nothing under it is still off the board
+    GRAPHQL_CALLS.clear()
+    core.build_board()
+    assert GRAPHQL_CALLS == []
+
+
+def test_a_finished_board_issue_stays_on_the_board_while_a_session_three_levels_under_it_is_live(monkeypatch):
+    # Neither issue between the closed acme/infra#20 and the step with the session is a card, so tavla climbs through them.
+    monkeypatch.setitem(SUB_ISSUES, "acme/infra#20", ["acme/infra#33"])
+    monkeypatch.setitem(SUB_ISSUES, "acme/infra#33", ["acme/infra#34"])
+    monkeypatch.setitem(SUB_ISSUES, "acme/infra#34", ["acme/infra#35"])
+    monkeypatch.setitem(PARENTS, "acme/infra#33", parent_node("acme/infra", 20, "Rotated the key"))
+    monkeypatch.setitem(PARENTS, "acme/infra#34", parent_node("acme/infra", 33, "Rotate it"))
+    monkeypatch.setitem(PARENTS, "acme/infra#35", parent_node("acme/infra", 34, "Rotate it in staging"))
+    core.link("cccc3333", "acme/infra#35")
+    board = core.build_board()
+    cards = {c["key"]: c for c in board["cards"]}
+    assert not cards["acme/infra#20"]["searchOnly"] and cards["acme/infra#20"]["isBoardIssue"] and "acme/infra#35" not in cards
+    assert [s["id"] for s in tree_card(board, "acme/infra#20", "acme/infra#33", "acme/infra#34", "acme/infra#35")["sessions"]] == ["cccc3333"]
+    GRAPHQL_CALLS.clear()
+    core.build_board()
+    assert GRAPHQL_CALLS == []
+
+
+def card_text(app, key):
+    """The text of a card's lines on the board, or of its cells in the list view."""
+    for it in app.query("CardItem, CardRow"):
+        if it.card["key"] == key:
+            return "  ".join(str(lb.render()) for lb in it.query("Label"))
+    raise AssertionError(f"{key} is not drawn")
+
+
+def test_tui_a_card_shows_a_session_two_levels_down_sorts_first_and_lists_it_under_a_sub_issues_divider(deep_work, monkeypatch):
+    from tavla import tui
+
+    attached = []
+    monkeypatch.setattr(core, "attach", lambda sid, title="", dry_run=False, cwd="": attached.append(sid) or "")
+
+    async def scenario():
+        app = tui.BoardApp()
+        async with app.run_test(size=(190, 50)) as pilot:
+            await app.workers.wait_for_complete()
+            assert shown(app)["todo"][:2] == ["acme/infra#9", "acme/charts#3"]  # needs you, before the working one
+            text = card_text(app, "acme/infra#9")
+            assert "● needs you" in text and "⎇ 1 PR" in text and "☑ 1/5" in text
+            await select_card(app, pilot, "acme/infra#9")
+            await pilot.press("space")
+            await pilot.pause()
+            sessions = app.query_one("#sessions")
+            rows = list(sessions.children)
+            assert [type(r).__name__ for r in rows] == ["Divider", "SessDetailRow"]
+            assert "  ".join(str(lb.render()) for lb in rows[0].query("Label")) == "Sub-issues  1"
+            assert "tools #41 +1 deep work" in "  ".join(str(lb.render()) for lb in rows[1].query("Label"))  # on two sub-issues: the first and how many more
+            assert str(app.query_one("#count-sessions").render()) == "1"
+            assert app.focused is sessions and sessions.highlighted_child is rows[1]
+            await pilot.press("ctrl+x")  # the session keys act on it as on any live session
+            await pilot.pause()
+            assert isinstance(app.screen, tui.StopOrDelete)
+            await pilot.press("escape")
+            await pilot.pause()
+            await pilot.press("enter")
+            await app.workers.wait_for_complete()
+            assert attached == ["gggg7777"]
+            await pilot.press("escape", "v")  # the list view shows the same roll-up
+            await pilot.pause()
+            text = card_text(app, "acme/infra#9")
+            assert "● needs you" in text and "⎇ 1 PR" in text and "☑ 1/5" in text
+
+    asyncio.run(scenario())
+
+
+def test_tui_every_card_on_the_way_down_shows_the_session_and_hiding_a_sub_issue_silences_it(deep_work):
+    from tavla import tui
+
+    async def scenario():
+        app = tui.BoardApp()
+        async with app.run_test(size=(190, 50)) as pilot:
+            await app.workers.wait_for_complete()
+            await select_card(app, pilot, "acme/infra#9")
+            await pilot.press("enter")
+            await pilot.pause()
+            assert shown(app)["todo"] == ["acme/infra#40", "acme/infra#11"] and "● needs you" in card_text(app, "acme/infra#40")
+            await select_card(app, pilot, "acme/infra#40")
+            await pilot.press("h")  # hide it, and with it the session under it
+            await pilot.pause()
+            await pilot.press("escape")
+            await pilot.pause()
+            text = card_text(app, "acme/infra#9")
+            assert "needs you" not in text and "PR" not in text and "☑ 1/5" in text  # still counted as not done
+
+    asyncio.run(scenario())
+
+
 def test_sub_issues_github_does_not_return_are_skipped_with_a_line_in_the_errors(plan, monkeypatch):
     monkeypatch.setitem(SUB_ISSUES, "acme/infra#40", ["acme/tools#41", None, "omitted", "acme/tools#43"])  # two hidden from me, one deleted
     UNREADABLE.add("acme/tools#43")
