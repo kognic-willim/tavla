@@ -1105,6 +1105,7 @@ def _build_board(force: bool, offline: bool) -> dict:
             cards.append(card)
     keep_finished_with_work_below(cards, meta, errors, force, offline, started)
     attach_subtrees(cards, make_card, meta, errors, force, offline, started)
+    cover_sub_issues(cards)
     roll_up(cards, load_hidden())
     # Unlinked means on no card and in no card's subtree: no issue found, or its issue has no card (e.g. GitHub couldn't be asked).
     on_card = set().union(*(subtree_keys(c) for c in cards))
@@ -1118,6 +1119,19 @@ def _build_board(force: bool, offline: bool) -> dict:
         key=lambda s: -s["updatedAt"],
     )
     return {"cards": cards, "unlinked": unlinked, "sprints": sprints, "viewer": viewer, "fetchedAt": now_ms(), "errors": errors, "isOffline": False}
+
+
+def cover_sub_issues(cards: list[dict]) -> None:
+    """Mark the issues under a board issue in the sprint as covered by it: they need no sprint of their own, so they
+    are not outside the sprint, carry no chip and are never moved into it. Issues on no sprint project stay None."""
+    todo = [sub for c in cards if c["isBoardIssue"] and (c["sprint"] or {}).get("state") in ("current", "leftover") for sub in c["subtree"]]
+    while todo:
+        card = todo.pop()
+        if is_outside(card["sprint"]):
+            card["sprint"] = {**card["sprint"], "state": "covered"}
+            card["searchOnly"] = card["searchOnly"] and not card["sprintFiltered"]  # filtered for its sprint alone, never for being done
+            card["sprintFiltered"] = False
+        todo += card["subtree"]
 
 
 def subtree_keys(card: dict) -> set[str]:
@@ -1400,6 +1414,43 @@ def create_issue(repo: str, title: str, body: str = "", assign: bool = True) -> 
         except OSError, json.JSONDecodeError, KeyError, TypeError:
             pass  # no cache yet: the next refresh searches anyway
     return {"key": key_of((m[1], m[2], int(m[3]))), "url": url, "title": issue["title"]}
+
+
+def make_sub_issue(parent: dict, issue: dict) -> None:
+    """Make a new issue ({key, title, url}) a sub-issue of parent (a card), and add it with no sprint to the project
+    parent's status comes from, so it has a status at once and its board issue's sprint covers it.
+
+    The parent's cached sub-issues list it at once, so the next refresh shows it inside the parent. Nothing is
+    rolled back: a failure raises, saying which step failed."""
+    repo, number = issue["key"].split("#")
+    p_repo, p_number = parent["key"].split("#")
+    try:
+        ids = json.loads(run(["gh", "api", f"repos/{repo}/issues/{number}"]))
+        run(["gh", "api", f"repos/{p_repo}/issues/{p_number}/sub_issues", "-X", "POST", "-F", f"sub_issue_id={ids['id']}"])
+    except Exception as err:
+        raise RuntimeError(f"could not make it a sub-issue of {parent['key']}: {err}") from err
+    try:
+        cache = json.loads((CONFIG / "meta-cache.json").read_text())
+        info = cache[parent["key"]]["info"]
+        if issue["key"] not in info["subIssueKeys"]:
+            info["subIssueKeys"].append(issue["key"])
+            info["subIssues"]["total"] += 1
+        (CONFIG / "meta-cache.json").write_text(json.dumps(cache))
+    except OSError, json.JSONDecodeError, KeyError, TypeError:
+        pass  # the parent isn't cached: the next refresh reads its sub-issues anyway
+    item = parent.get("statusItem")
+    if not item:
+        return
+    try:
+        body = graphql(ADD_ITEM_MUTATION, {"project": status_field(item["project"])["project"], "content": ids["node_id"]})
+        item_id = (((body.get("data") or {}).get("addProjectV2ItemById") or {}).get("item") or {}).get("id")
+        if not item_id:
+            raise RuntimeError(first_error(body))
+    except Exception as err:
+        raise RuntimeError(f"could not add it to project {item['project']} (it is a sub-issue of {parent['key']}): {err}") from err
+    backlog = next((p["is_backlog"] for p in PROJECTS if project_id(p) == item["project"]), False)
+    entry = {"key": issue["key"], "title": issue["title"], "url": issue["url"], "status": "", "isBacklog": backlog, "project": item["project"], "itemId": item_id, "sprint": None}
+    patch_projects_cache(item_id, {}, new=entry)
 
 
 def status_field(project: str) -> dict:

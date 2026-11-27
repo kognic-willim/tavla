@@ -44,6 +44,7 @@ SPRINT_WRITES: list[tuple[str, dict]] = []
 # The iteration field of each project, as GitHub's field(name:) answers it: None when the project has no field by that name.
 SPRINT_FIELDS: dict[str, dict | None] = {}
 RESUMED: list[dict] = []
+GH_API_CALLS: list[list[str]] = []  # the REST calls: a new issue's ids, and making it a sub-issue
 # Another session's attached tab, and a shell that only mentions the session: neither is a tab on aaaa1111.
 PS_OUTPUT = "ttys003  claude attach cccc3333\nttys004  grep claude attach aaaa1111\n??       claude --bg aaaa1111\n"
 
@@ -69,6 +70,12 @@ def fake_run(argv, timeout=60, cwd=None):
     if cmd.startswith("gh issue create"):
         repo = argv[argv.index("--repo") + 1]
         return f"\nCreating issue in {repo}\n\nhttps://github.com/{repo}/issues/77\n"
+    if cmd.startswith("gh api repos/"):
+        GH_API_CALLS.append(argv)
+        if argv[2].endswith("/sub_issues"):
+            return json.dumps({"id": 1})
+        n = int(argv[2].rsplit("/", 1)[1])
+        return json.dumps({"id": 9000 + n, "node_id": f"I_kw{n}", "number": n})
     if cmd.startswith("claude --bg") and "--resume" in argv:
         RESUMED.append({"argv": argv, "cwd": cwd})
         return f"backgrounded · {argv[-1][:8]} (idle — send a prompt to start)\n"
@@ -214,6 +221,7 @@ def env(tmp_path, monkeypatch):
     SPRINT_WRITES.clear()
     SPRINT_FIELDS.clear()
     RESUMED.clear()
+    GH_API_CALLS.clear()
     UNREADABLE.clear()
 
 
@@ -2426,14 +2434,14 @@ def test_tui_an_opened_issue_shows_every_sub_issue_and_dims_only_someone_elses(s
             await select_card(app, pilot, "acme/infra#7")
             await pilot.press("enter")
             await pilot.pause()
-            # Outside the sprint (#9 no sprint, #14 planned) or closed long ago (#31): an opened issue shows them all.
+            # Covered by #7's sprint (#9 no sprint, #14 planned) or closed long ago (#31): an opened issue shows them all.
             cols = shown(app)
             assert sorted(cols["todo"]) == ["acme/infra#14", "acme/infra#40", "acme/infra#9"] and cols["done"] == ["acme/infra#31"]
             cards = {c.card["key"]: c for c in app.query(tui.CardItem)}
             assert [k for k, c in sorted(cards.items()) if c.has_class("is-theirs")] == ["acme/infra#40"]
             assert not any(c.has_class("is-outside") for c in cards.values())  # outside the sprint is not dimmed in here
             assert "@octocat" in str(cards["acme/infra#40"].query_one(".card-meta").content)
-            assert "@" not in str(cards["acme/infra#14"].query_one(".card-meta").content)
+            assert "@" not in "".join(str(lb.content) for lb in cards["acme/infra#14"].query(".card-meta"))  # covered by #7's sprint: no chip either
             await pilot.press("v")
             await pilot.pause()
             row = next(r for r in app.query(tui.CardRow) if r.card["key"] == "acme/infra#40")
@@ -2724,7 +2732,7 @@ def test_between_two_sprints_the_last_started_one_is_current(sprints, monkeypatc
     assert board["sprints"] == [] and sprint_of(board)["acme/infra#13"] == ({"title": "Sprint 14", "state": "planned"}, True)
 
 
-def test_an_issue_in_the_sprint_on_one_sprint_project_is_in_the_sprint(sprints, monkeypatch):
+def test_an_issue_in_the_sprint_on_one_sprint_project_is_in_the_sprint(sprints, lone_todo, monkeypatch):
     monkeypatch.setitem(core.PROJECTS[0], "sprint", "Sprint")  # the backlog project is a sprint project too
     SPRINT_FIELDS["me"] = SPRINT_FIELD
     monkeypatch.setitem(PROJECTS, "me", [item("acme/infra", 9, "Assigned but untouched", "Todo", S15), item("acme/infra", 11, "Personal todo", "Todo", S16)])
@@ -2930,6 +2938,73 @@ def test_tui_new_issue_is_added_to_the_current_sprint_unless_unticked(sprints, m
     asyncio.run(scenario())
 
 
+def test_tui_i_inside_an_opened_issue_creates_a_sub_issue_on_its_project_that_shows_in_it_covered(sprints, monkeypatch):
+    from tavla import tui
+
+    monkeypatch.setitem(SUB_ISSUES, "acme/infra#7", ["acme/infra#9"])
+    calls = []
+    monkeypatch.setattr(core, "run", lambda argv, timeout=60, cwd=None: calls.append(argv) or fake_run(argv))
+
+    async def scenario():
+        app = tui.BoardApp()
+        async with app.run_test(size=(190, 50)) as pilot:
+            await app.workers.wait_for_complete()
+            await select_card(app, pilot, "acme/infra#7")
+            await pilot.press("enter")
+            await pilot.pause()
+            await pilot.press("i")
+            await pilot.pause()
+            dialog = app.screen
+            assert isinstance(dialog, tui.NewIssue) and not dialog.query("#issue-sprint")  # a sub-issue is covered: no sprint box
+            assert "New sub-issue of acme/infra#7 Deploy is flaky" in str(dialog.query_one(tui.Label).content)
+            repos = dialog.query_one("#issue-repo", tui.RadioSet)
+            assert repos.pressed_index == 0 and "acme/infra" in str(repos.pressed_button.label)  # its parent's repository, though not an issue_repo
+            await pilot.press(*"Write the runbook", "enter")
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            assert ["gh", "issue", "create", "--repo", "acme/infra", "--title", "Write the runbook", "--body", "", "--assignee", "@me"] in calls
+            assert GH_API_CALLS == [["gh", "api", "repos/acme/infra/issues/77"], ["gh", "api", "repos/acme/infra/issues/7/sub_issues", "-X", "POST", "-F", "sub_issue_id=9077"]]
+            assert SPRINT_WRITES == [("add", {"project": "PVT_team", "content": "I_kw77"})]  # on its parent's project, in no sprint
+            assert isinstance(app.screen, tui.AskPrompt)  # the optional session, as for any new issue
+            await pilot.press("escape")
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            assert sorted(shown(app)["todo"]) == ["acme/infra#77", "acme/infra#9"]  # the next refresh, without waiting for GitHub's search
+            new = next(it for it in app.query(tui.CardItem) if it.card["key"] == "acme/infra#77")
+            assert new.card["sprint"]["state"] == "covered" and "sprint" not in "".join(str(lb.content) for lb in new.query(".card-meta")).lower()
+
+    asyncio.run(scenario())
+
+
+def test_tui_a_sub_issue_that_could_not_be_linked_stays_created_and_the_message_names_it(plan, monkeypatch):
+    from tavla import tui
+
+    def no_link(argv, timeout=60, cwd=None):
+        if argv[2].endswith("/sub_issues"):
+            raise RuntimeError("gh api repos/acme/infra/issues/9/sub_issues: HTTP 422")
+        return fake_run(argv, timeout, cwd)
+
+    monkeypatch.setattr(core, "run", no_link)
+
+    async def scenario():
+        app = tui.BoardApp()
+        async with app.run_test(size=(190, 50)) as pilot:
+            await app.workers.wait_for_complete()
+            await select_card(app, pilot, "acme/infra#9")
+            await pilot.press("enter")
+            await pilot.pause()
+            await pilot.press("i")
+            await pilot.pause()
+            await pilot.press(*"Loose end", "enter")
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            errors = [str(n.message) for n in app._notifications if n.severity == "error"]
+            assert any("https://github.com/acme/infra/issues/77" in e and "sub-issue of acme/infra#9" in e and "HTTP 422" in e for e in errors)
+            assert isinstance(app.screen, tui.AskPrompt)  # created all the same: a session can still start on it
+
+    asyncio.run(scenario())
+
+
 def test_tui_starting_work_on_an_issue_outside_the_sprint_moves_it_into_the_sprint(sprints, monkeypatch):
     from tavla import tui
 
@@ -2957,6 +3032,34 @@ def test_tui_starting_work_on_an_issue_outside_the_sprint_moves_it_into_the_spri
     asyncio.run(scenario())
 
 
+def test_tui_a_covered_sub_issue_has_no_sprint_chip_and_n_offers_only_in_progress(sprints, monkeypatch):
+    from tavla import tui
+
+    monkeypatch.setitem(SUB_ISSUES, "acme/infra#7", ["acme/infra#9"])  # Todo with no sprint, under a board issue in Sprint 15
+    monkeypatch.setattr(core, "new_session", lambda target, prompt="", title="": "dddd4444")
+
+    async def scenario():
+        app = tui.BoardApp()
+        async with app.run_test(size=(190, 45)) as pilot:
+            await app.workers.wait_for_complete()
+            assert "Sprint 15 · 13 days left · 1 outside" in str(app.query_one("#status").content)  # only acme/infra#14, planned
+            await select_card(app, pilot, "acme/infra#7")
+            await pilot.press("enter")
+            await pilot.pause()
+            assert app.current_key() == "card:acme/infra#9"
+            meta = "".join(str(lb.content) for lb in app.query_one(tui.CardItem).query(".card-meta"))
+            assert "sprint" not in meta.lower()
+            await pilot.press("n")
+            await pilot.pause()
+            box = app.screen.query_one("#to-progress", tui.Checkbox)
+            assert box.value is True and str(box.label) == "Move the issue from Todo to In Progress"
+            await pilot.press("enter")
+            await app.workers.wait_for_complete()
+            assert [v["item"] for v in STATUS_SETS] == ["PVTI_9"] and SPRINT_WRITES == []
+
+    asyncio.run(scenario())
+
+
 def test_sub_issues_outside_the_sprint_are_in_the_tree_and_a_search_only_cards_subtree_is_not_read(sprints, monkeypatch):
     monkeypatch.setitem(SUB_ISSUES, "acme/infra#7", ["acme/infra#9"])  # no sprint, under a board issue in the sprint
     monkeypatch.setitem(SUB_ISSUES, "acme/infra#14", ["acme/infra#80"])  # planned: search-only
@@ -2964,10 +3067,42 @@ def test_sub_issues_outside_the_sprint_are_in_the_tree_and_a_search_only_cards_s
     monkeypatch.setattr(core, "graphql", lambda query, variables=None: queries.append(query) or fake_graphql(query, variables))
     cards = every_card(core.build_board())
     assert tree(cards["acme/infra#7"]) == [("acme/infra#9", "Todo", [("acme/infra#11", "Todo", [])])]
-    assert cards["acme/infra#9"]["searchOnly"] and not cards["acme/infra#9"]["isBoardIssue"]
+    assert cards["acme/infra#9"]["sprint"]["state"] == "covered" and not cards["acme/infra#9"]["isBoardIssue"]
     assert not cards["acme/infra#11"]["isBoardIssue"]  # under a board issue, two levels down
     assert cards["acme/infra#14"]["subtree"] == [] and not cards["acme/infra#14"]["isBoardIssue"]
     assert not any("issueOrPullRequest(number: 80)" in q for q in queries)
+
+
+def test_a_sub_issue_under_a_board_issue_in_the_sprint_is_covered_not_outside(sprints, monkeypatch):
+    monkeypatch.setitem(SUB_ISSUES, "acme/infra#7", ["acme/infra#9", "acme/infra#14"])  # no sprint, and planned, under the current sprint
+    monkeypatch.setitem(SUB_ISSUES, "acme/infra#13", ["acme/charts#3"])  # no sprint, under a leftover
+    board = core.build_board()
+    cards = sprint_of(board)
+    assert cards["acme/infra#9"] == ({"title": "", "state": "covered"}, False)
+    assert cards["acme/infra#14"] == ({"title": "Sprint 16", "state": "covered"}, False)
+    assert cards["acme/infra#11"] == (None, False)  # two levels down, on no sprint project: no sprint to cover
+    assert cards["acme/charts#3"] == ({"title": "", "state": "covered"}, False)
+    assert not any(c["sprintFiltered"] for c in every_card(board).values())
+
+
+def test_a_sub_issue_under_a_board_issue_on_no_sprint_project_keeps_its_own_sprint(sprints, monkeypatch, capsys):
+    monkeypatch.setitem(SUB_ISSUES, "acme/infra#11", ["acme/infra#14"])  # planned, under a board issue on no sprint project
+    monkeypatch.delitem(PARENTS, "acme/infra#11")
+    monkeypatch.setitem(SUB_ISSUES, "acme/infra#9", [])
+    assert core.main(["json"]) == 0
+    cards = {c["key"]: c for c in json.loads(capsys.readouterr().out)["cards"]}
+    assert cards["acme/infra#11"]["sprint"] is None and cards["acme/infra#11"]["isBoardIssue"]
+    sub = cards["acme/infra#11"]["subtree"][0]
+    assert (sub["key"], sub["sprint"], sub["sprintFiltered"]) == ("acme/infra#14", {"title": "Sprint 16", "state": "planned"}, True)
+
+
+def test_a_sub_issue_under_a_board_issue_outside_the_sprint_keeps_its_own_sprint(sprints, monkeypatch):
+    monkeypatch.setitem(SUB_ISSUES, "acme/charts#3", ["acme/infra#14"])  # planned, under a board issue with no sprint that a session keeps
+    board = core.build_board()
+    cards = sprint_of(board)
+    assert cards["acme/charts#3"] == ({"title": "", "state": "none"}, False)
+    assert cards["acme/infra#14"] == ({"title": "Sprint 16", "state": "planned"}, True)
+    assert [s["key"] for s in every_card(board)["acme/charts#3"]["subtree"]] == ["acme/infra#14"]
 
 
 def test_an_issue_with_a_session_whose_parent_is_outside_the_sprint_is_a_board_issue(sprints):
