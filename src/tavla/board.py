@@ -43,6 +43,10 @@ ASSIGNED_TTL_S = 300  # open issues assigned to me
 META_TTL_S = 600  # issue/PR metadata: labels, sub-issues, linked PRs, open state
 CLOSED_TTL_S = 900  # recently closed issues, which only a search shows
 CLOSED_DAYS = 30
+# GitHub allows 100 sub-issues per issue and eight levels of nesting, so one page reads them all and the walk stops there.
+SUB_ISSUES_PER_ISSUE = 100
+SUB_ISSUE_LEVELS = 8
+CLOSES_READ = 20  # issues read from each PR's closing list
 PROJECT_QUERY = """
 query($owner: String!, $number: Int!, $cursor: String) {
   repositoryOwner(login: $owner) { ... on ProjectV2Owner { projectV2(number: $number) {
@@ -686,10 +690,13 @@ def issue_sprint(items: list[dict], current: dict[str, dict | None], day: date) 
     return best
 
 
-def resolve_refs(refs: list[Ref], errors: list[str], force: bool = False, offline: bool = False) -> dict[str, dict]:
+def resolve_refs(refs: list[Ref], errors: list[str], force: bool = False, offline: bool = False, fresh_after: float | None = None, unreadable: set[str] | None = None) -> dict[str, dict]:
     """One GraphQL call per 40 refs: an issue resolves to itself with its card metadata, a PR to its
     own state and the issues it closes. Answers are cached for META_TTL_S, so a routine refresh only
-    asks about refs it has not seen lately; offline, only cached answers are used, whatever their age."""
+    asks about refs it has not seen lately; offline, only cached answers are used, whatever their age.
+
+    force asks again about every ref not fetched since fresh_after, so one forced build asks once.
+    unreadable collects the refs GitHub answered nothing for (deleted, or no access)."""
     cache_file = CONFIG / "meta-cache.json"
     try:
         cache: dict[str, dict] = json.loads(cache_file.read_text())
@@ -699,18 +706,28 @@ def resolve_refs(refs: list[Ref], errors: list[str], force: bool = False, offlin
     uniq = list({key_of(r): r for r in refs}.values())
 
     def outdated(entry: dict) -> bool:
-        """Cached before the parent issue was fetched: asked again at once, whatever its age."""
+        """Cached by an older version, before the parent issue, the sub-issues or the longer closing lists were read: asked again at once, whatever its age."""
         info = entry.get("info") or {}
-        return any("parent" not in i for i in ([info] if info.get("kind") == "Issue" else info.get("closes") or []))
+        if info.get("kind") == "Issue":
+            return "parent" not in info or "subIssueKeys" not in info
+        return bool(info) and (info.get("closesRead") != CLOSES_READ or any("parent" not in i for i in info.get("closes") or []))
 
-    stale = [] if offline else [r for r in uniq if force or now - cache.get(key_of(r), {}).get("at", 0) >= META_TTL_S or outdated(cache[key_of(r)])]
-    fetched = _fetch_refs(stale, errors)
-    for r in stale:
+    def stale(r: Ref) -> bool:
+        entry = cache.get(key_of(r), {})
+        if force:
+            return entry.get("at", 0) < (now if fresh_after is None else fresh_after)
+        return now - entry.get("at", 0) >= META_TTL_S or outdated(entry)
+
+    asked = [] if offline else [r for r in uniq if stale(r)]
+    fetched = _fetch_refs(asked, errors)
+    for r in asked:
         if key_of(r) in fetched or key_of(r) not in cache:
             cache[key_of(r)] = {"at": now, "info": fetched.get(key_of(r))}
-    if stale:
+    if asked:
         CONFIG.mkdir(parents=True, exist_ok=True)
         cache_file.write_text(json.dumps(cache))
+    if unreadable is not None:
+        unreadable.update(key_of(r) for r in uniq if key_of(r) in cache and not cache[key_of(r)].get("info"))
     return {key_of(r): cache[key_of(r)]["info"] for r in uniq if (cache.get(key_of(r)) or {}).get("info")}
 
 
@@ -718,12 +735,13 @@ def _fetch_refs(uniq: list[Ref], errors: list[str]) -> dict[str, dict]:
     out: dict[str, dict] = {}
     pr_fields = "number state url repository { nameWithOwner }"
     parent_fields = "number title url state repository { nameWithOwner } subIssuesSummary { total completed }"
+    # A PR's closing issues read no connection: GraphQL charges per connection read, times the issues read.
+    slim_fields = f"number title body url state updatedAt repository {{ nameWithOwner }} subIssuesSummary {{ total completed }} parent {{ {parent_fields} }}"
     fields = (
-        "number title body url state updatedAt repository { nameWithOwner }"
-        " labels(first: 6) { nodes { name color } } subIssuesSummary { total completed }"
+        f"{slim_fields} labels(first: 6) {{ nodes {{ name color }} }}"
         " assignees(first: 3) { nodes { login } }"
-        f" parent {{ {parent_fields} }}"
         f" closedByPullRequestsReferences(first: 10, includeClosedPrs: true) {{ nodes {{ {pr_fields} }} }}"
+        f" subIssues(first: {SUB_ISSUES_PER_ISSUE}) {{ totalCount nodes {{ number repository {{ nameWithOwner }} }} }}"
     )
 
     def to_pr(n: dict) -> dict:
@@ -740,7 +758,7 @@ def _fetch_refs(uniq: list[Ref], errors: list[str]) -> dict[str, dict]:
         return {"key": key, "title": n["title"], "url": n["url"], "isOpen": n["state"] == "OPEN", "subIssues": sub_issues(n)}
 
     def to_issue(n: dict) -> dict:
-        return {
+        issue = {
             "kind": "Issue",
             "key": f"{n['repository']['nameWithOwner']}#{n['number']}".lower(),
             "title": n["title"],
@@ -754,12 +772,19 @@ def _fetch_refs(uniq: list[Ref], errors: list[str]) -> dict[str, dict]:
             "assignees": [a["login"] for a in (n.get("assignees") or {}).get("nodes") or []],
             "prs": [to_pr(p) for p in (n.get("closedByPullRequestsReferences") or {}).get("nodes") or []],
         }
+        if "subIssues" in n:  # looked up directly, not read from a PR's closing list
+            nodes = (n["subIssues"] or {}).get("nodes") or []
+            missing = max(0, ((n["subIssues"] or {}).get("totalCount") or 0) - len(nodes))
+            full = len(nodes) >= SUB_ISSUES_PER_ISSUE  # past a full page they are unread; short of one, GitHub left them out
+            issue["subIssueKeys"] = [f"{s['repository']['nameWithOwner']}#{s['number']}".lower() for s in nodes if s]
+            issue["subIssuesUnread"] = {"hidden": sum(1 for s in nodes if not s) + (0 if full else missing), "beyond": missing if full else 0}
+        return issue
 
     def fetch(chunk: list[Ref]) -> None:
         body = "\n".join(
             f'r{j}: repository(owner: "{o}", name: "{r}") {{ issueOrPullRequest(number: {n}) {{'
             f" __typename ... on Issue {{ {fields} }}"
-            f" ... on PullRequest {{ {pr_fields} closingIssuesReferences(first: 5) {{ nodes {{ {fields} }} }} }} }} }}"
+            f" ... on PullRequest {{ {pr_fields} closingIssuesReferences(first: {CLOSES_READ}) {{ nodes {{ {slim_fields} }} }} }} }} }}"
             for j, (o, r, n) in enumerate(chunk)
         )
         try:
@@ -776,7 +801,8 @@ def _fetch_refs(uniq: list[Ref], errors: list[str]) -> dict[str, dict]:
             if node["__typename"] == "Issue":
                 out[key_of(r)] = to_issue(node)
             else:
-                out[key_of(r)] = {"kind": "PullRequest", **to_pr(node), "closes": [to_issue(n) for n in node["closingIssuesReferences"]["nodes"]]}
+                closes = [to_issue(n) for n in (node.get("closingIssuesReferences") or {}).get("nodes") or [] if n]
+                out[key_of(r)] = {"kind": "PullRequest", **to_pr(node), "closes": closes, "closesRead": CLOSES_READ}
 
     # Chunks in parallel: each takes over a second, and the recently closed issues add a couple.
     chunks = [uniq[i : i + 40] for i in range(0, len(uniq), 40)]
@@ -784,6 +810,71 @@ def _fetch_refs(uniq: list[Ref], errors: list[str]) -> dict[str, dict]:
         with ThreadPoolExecutor(min(len(chunks), 4)) as pool:
             list(pool.map(fetch, chunks))
     return out
+
+
+def lookup_directly(keys: list[str], meta: dict[str, dict], errors: list[str], force: bool, offline: bool, fresh_after: float, unreadable: set[str] | None = None) -> None:
+    """Put each issue's own lookup in meta, in place of what a PR's closing list said of it; cached ones cost nothing."""
+    infos = resolve_refs([r for k in keys if (r := ref_from_arg(k))], errors, force, offline, fresh_after, unreadable)
+    for key, info in infos.items():
+        if info["kind"] == "Issue":
+            meta[key] = info
+
+
+def attach_subtrees(cards: list[dict], make_card, meta: dict[str, dict], errors: list[str], force: bool, offline: bool, fresh_after: float) -> None:
+    """Give each card on the board its subtree, as nested cards, and say which cards are board issues.
+
+    The sub-issues are looked up level by level from the cards on the board, every level in one
+    batched lookup, up to SUB_ISSUE_LEVELS down. A search-only card's subtree is not read.
+    A board issue is a card on the board that is in no other one's subtree."""
+    roots = [c["key"] for c in cards if not c["searchOnly"]]
+    unreadable: set[str] = set()
+    read: dict[str, None] = {}  # the issues whose sub-issues were read, in walk order
+    level = roots
+    for _ in range(SUB_ISSUE_LEVELS):
+        children = []
+        for key in level:
+            if key not in read and "subIssueKeys" in meta.get(key, {}):
+                read[key] = None
+                children += meta[key]["subIssueKeys"]
+        if not children:
+            break
+        lookup_directly(list(dict.fromkeys(children)), meta, errors, force, offline, fresh_after, unreadable)
+        level = children
+
+    for key in read:
+        unread = meta[key].get("subIssuesUnread") or {}
+        if unread.get("hidden"):
+            errors.append(f"{key}: {unread['hidden']} sub-issue(s) not readable, skipped")
+        if unread.get("beyond"):
+            errors.append(f"{key}: only the first {SUB_ISSUES_PER_ISSUE} sub-issues are read, {unread['beyond']} more are not shown")
+        errors.extend(f"{sub}: sub-issue of {key} not readable, skipped" for sub in meta[key]["subIssueKeys"] if sub in unreadable)
+
+    built = {c["key"]: c for c in cards}
+    grown: set[str] = set()
+
+    def grow(key: str, path: frozenset[str]) -> dict:
+        card = built.get(key)
+        if card is None:
+            m = meta[key]
+            card = built[key] = make_card(key, {"title": m["title"], "url": m["url"], "isOpen": m["isOpen"], "updatedAt": m["updatedAt"]})
+        if key not in grown and key in read:
+            grown.add(key)
+            # The path guard keeps answers cached at different times from nesting an issue inside itself.
+            card["subtree"] = [grow(sub, path | {key}) for sub in meta[key]["subIssueKeys"] if sub in meta and sub not in path | {key}]
+        return card
+
+    def descendants(card: dict, seen: set[str]) -> set[str]:
+        for sub in card["subtree"]:
+            if sub["key"] not in seen:
+                seen.add(sub["key"])
+                descendants(sub, seen)
+        return seen
+
+    for key in roots:
+        grow(key, frozenset())
+    inside = set().union(*(descendants(built[key], set()) for key in roots))
+    for key in roots:
+        built[key]["isBoardIssue"] = key not in inside
 
 
 # --- board -------------------------------------------------------------------
@@ -815,6 +906,7 @@ def cached_board() -> dict:
 
 
 def _build_board(force: bool, offline: bool) -> dict:
+    started = time.time()
     errors: list[str] = []
     links = load_links()
     with ThreadPoolExecutor(4) as pool:
@@ -878,16 +970,22 @@ def _build_board(force: bool, offline: bool) -> dict:
     session_refs = [r for _, refs in raw for r in refs] + [r for keys in links.values() for k in keys if (r := ref_from_arg(k))]
     # Issues known only from search or a project need their metadata too; one pass resolves everything.
     known_refs = [r for k in issues if (r := ref_from_arg(k))]
-    infos = resolve_refs(session_refs + known_refs, errors, force, offline)
+    infos = resolve_refs(session_refs + known_refs, errors, force, offline, started)
     from_sessions = {key_of(r) for r in session_refs}
     meta: dict[str, dict] = {}  # full GraphQL view of each issue, for the card metadata
+    closed_by: dict[str, list[dict]] = {}  # the session PRs that close each issue
     for key, info in infos.items():
         for i in [info] if info["kind"] == "Issue" else info["closes"]:
-            meta[i["key"]] = i
+            if info["kind"] == "Issue" or i["key"] not in meta:  # a PR's closing list reads less than a direct lookup
+                meta[i["key"]] = i
+            if info["kind"] == "PullRequest":
+                closed_by.setdefault(i["key"], []).append({"key": info["key"], "url": info["url"], "state": info["state"]})
             if key in from_sessions:
                 add_issue(i["key"], i["title"], i["url"], i["isOpen"], i["updatedAt"])
             elif i["key"] in issues:
                 issues[i["key"]]["isOpen"] = i["isOpen"]
+    # An issue known only from a PR's closing list is looked up directly, for its labels, closing PRs and sub-issues.
+    lookup_directly(list(issues), meta, errors, force, offline, started)
 
     sessions = []
     for sess, refs in raw:
@@ -906,16 +1004,15 @@ def _build_board(force: bool, offline: bool) -> dict:
 
     past = sorted(update_history(sessions, links, errors), key=lambda s: -s["updatedAt"])
     recent = now_ms() - RECENT_S * 1000
-    cards = []
-    for key, iss in issues.items():
+    closes_any = {k for k, info in infos.items() if info["kind"] == "PullRequest" and info["closes"]}
+
+    def make_card(key: str, iss: dict) -> dict:
         ss = sorted((s for s in sessions if key in s["issues"]), key=lambda s: -s["updatedAt"])
         kinds = {s["kind"] for s in ss}
         session_column = "needs" if "needs" in kinds else "working" if "working" in kinds else "idle" if ss else "backlog"
         status = status_of.get(key, "")
         status_column = status_column_of(status, iss["isOpen"])
         last_touch = max((s["updatedAt"] for s in ss), default=0)
-        if session_column == "backlog" and not iss["isMine"]:
-            continue
         # A finished issue stays on the board only while a session on it is live or recent; after that a search still finds it.
         search_only = status_column == "done" and session_column in ("idle", "backlog") and last_touch < recent
         # Closed issues are exempt: the project lists hold open issues only.
@@ -923,32 +1020,41 @@ def _build_board(force: bool, offline: bool) -> dict:
         # Outside the sprint, an issue leaves the board unless a session is on it; a search still finds it.
         sprint_filtered = is_outside(sprint) and not ss and not search_only
         m = meta.get(key, {})
-        prs = {p["key"]: p for p in [*m.get("prs", []), *(p for s in ss for p in s["prs"])]}
-        cards.append(
-            {
-                "key": key,
-                "url": iss["url"],
-                "title": iss["title"],
-                "isOpen": iss["isOpen"],
-                "status": status if iss["isOpen"] else "Closed",
-                "statusColumn": status_column,
-                "statusItem": status_item.get(key) or unset_item.get(key),
-                "sessionColumn": session_column,
-                "searchOnly": search_only or sprint_filtered,
-                "sprint": sprint,
-                "sprintItem": {"project": sprint_item["project"], "itemId": sprint_item["itemId"]} if sprint_item else None,
-                "sprintFiltered": sprint_filtered,
-                "updatedAt": max(iss["updatedAt"], last_touch),
-                "sessions": ss,
-                "pastSessions": [s for s in past if key in s["issues"]],
-                "prs": list(prs.values()),
-                "labels": m.get("labels", []),
-                "subIssues": m.get("subIssues", {"total": 0, "completed": 0}),
-                "parent": m.get("parent"),
-                "assignees": m.get("assignees", []),
-                "body": m.get("body", ""),
-            }
-        )
+        # The PRs that close the issue, and those of its sessions that close no issue at all.
+        loose = [p for s in ss for p in s["prs"] if p["key"] not in closes_any]
+        prs = {p["key"]: p for p in [*m.get("prs", []), *closed_by.get(key, []), *loose]}
+        return {
+            "key": key,
+            "url": iss["url"],
+            "title": iss["title"],
+            "isOpen": iss["isOpen"],
+            "status": status if iss["isOpen"] else "Closed",
+            "statusColumn": status_column,
+            "statusItem": status_item.get(key) or unset_item.get(key),
+            "sessionColumn": session_column,
+            "searchOnly": search_only or sprint_filtered,
+            "sprint": sprint,
+            "sprintItem": {"project": sprint_item["project"], "itemId": sprint_item["itemId"]} if sprint_item else None,
+            "sprintFiltered": sprint_filtered,
+            "updatedAt": max(iss["updatedAt"], last_touch),
+            "sessions": ss,
+            "pastSessions": [s for s in past if key in s["issues"]],
+            "prs": list(prs.values()),
+            "labels": m.get("labels", []),
+            "subIssues": m.get("subIssues", {"total": 0, "completed": 0}),
+            "parent": m.get("parent"),
+            "assignees": m.get("assignees", []),
+            "body": m.get("body", ""),
+            "isBoardIssue": False,
+            "subtree": [],
+        }
+
+    cards = []
+    for key, iss in issues.items():
+        card = make_card(key, iss)
+        if card["sessionColumn"] != "backlog" or iss["isMine"]:
+            cards.append(card)
+    attach_subtrees(cards, make_card, meta, errors, force, offline, started)
     liveness = {"needs": 0, "working": 1}
     cards.sort(key=lambda c: (liveness.get(c["sessionColumn"], 2), -c["updatedAt"]))
     # Unlinked means on no card: no issue found, or its issue has no card (e.g. GitHub couldn't be asked).
@@ -1028,8 +1134,20 @@ def ago(ms: int) -> str:
 
 
 def summary(board: dict, grouping: str) -> str:
+    """The board as text. By status or session it lists the board issues, each with its subtree indented beneath it."""
     lines = []
-    on_board = [c for c in board["cards"] if not c.get("searchOnly")]
+    on_board = [c for c in board["cards"] if not c.get("searchOnly") and (grouping == "parent" or c.get("isBoardIssue", True))]
+
+    def sessions(card: dict, depth: int) -> list[str]:
+        return [f'{"  " * depth}- {s["id"]} {s["state"]} "{s["name"]}" {ago(s["updatedAt"])}' for s in card["sessions"]]
+
+    def subtree(card: dict, depth: int) -> list[str]:
+        out = []
+        for sub in card.get("subtree") or []:
+            tag = " · ".join(t for t in (sub["status"], badge(sub)) if t)
+            out += [f"{'  ' * depth}- {sub['key']} {sub['title']}" + (f" [{tag}]" if tag else ""), *sessions(sub, depth + 1), *subtree(sub, depth + 1)]
+        return out
+
     for group in groups(on_board, grouping):
         cs = group["cards"]
         if grouping == "parent" and not cs:
@@ -1039,7 +1157,9 @@ def summary(board: dict, grouping: str) -> str:
         for c in cs:
             tag = badge(c) if grouping == "status" else c["status"]
             lines.append(f"- {c['key']} {c['title']}" + (f" [{tag}]" if tag else ""))
-            lines += [f'  - {s["id"]} {s["state"]} "{s["name"]}" {ago(s["updatedAt"])}' for s in c["sessions"]]
+            lines += sessions(c, 1)
+            if grouping != "parent":
+                lines += subtree(c, 1)
     lines.append(f"## Unlinked sessions ({len(board['unlinked'])})")
     lines += [f'- {s["id"]} {s["state"]} "{s["name"]}" {ago(s["updatedAt"])}' for s in board["unlinked"]]
     if board["errors"]:
