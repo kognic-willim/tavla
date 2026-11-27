@@ -944,8 +944,9 @@ class BoardApp(App):
         level = self.level_cards()
         cards = level if self.path else [c for c in level if self.show_outside or not c.get("sprintFiltered")]
         if self.filter:
-            shown = sum(1 for c in self.level_rows() if self.show_hidden or c["key"] not in self.hidden)
-            group += f"  ·  filter [$accent]{escape(self.filter)}[/]: {shown} of {plural(len(level), 'issue')}"
+            shown = sum(1 for c in self.level_rows() if c["key"] not in self.hidden_from_search())
+            reach = sum(1 for c in level if c["key"] not in self.hidden_from_search())
+            group += f"  ·  filter [$accent]{escape(self.filter)}[/]: {shown} of {plural(reach, 'issue')}"
         if n_hidden := sum(1 for c in cards if c["key"] in self.hidden):
             group += f"  ·  {n_hidden} hidden ({'shown, ' if self.show_hidden else ''}H toggles)"
         group += self.sprint_status()
@@ -1030,7 +1031,7 @@ class BoardApp(App):
     def visible(self, rows: list[dict]) -> list[dict]:
         """The rows to draw: a filter also reaches the search-only cards (finished issues that left the board)."""
         if self.filter:
-            return [r for r in rows if core.matches(r, self.filter)]
+            return [r for r in rows if core.matches(r, self.filter, self.hidden_from_search())]
         return [r for r in rows if not r.get("searchOnly") or (self.show_outside and r.get("sprintFiltered"))]
 
     def opened(self) -> list[dict]:
@@ -1058,7 +1059,11 @@ class BoardApp(App):
             return self.visible(self.data["cards"])
         viewer = (self.data.get("viewer") or "").lower()
         cards = [{**c, "sprintFiltered": False, "isTheirs": bool(viewer) and viewer not in (a.lower() for a in c.get("assignees") or [])} for c in self.level_cards()]
-        return [c for c in cards if core.matches(c, self.filter)] if self.filter else cards
+        return [c for c in cards if core.matches(c, self.filter, self.hidden_from_search())] if self.filter else cards
+
+    def hidden_from_search(self) -> set[str]:
+        """The hidden issues a search leaves out: none while H shows them."""
+        return set() if self.show_hidden else self.hidden
 
     def groups(self) -> list[dict]:
         cards = [{**c, "hidden": True} if c["key"] in self.hidden else c for c in self.level_rows()]
@@ -1260,6 +1265,8 @@ class BoardApp(App):
         self.update_status()
         if focus:
             self.focus_board()
+            if self.current is None:  # a level a search leaves empty: the board keeps the keys, so esc still goes up
+                self.query(".col ListView").first(ListView).focus()
 
     def open_sessions(self, card: dict) -> None:
         sessions = self.query_one("#sessions", CardList)
