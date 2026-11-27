@@ -24,7 +24,7 @@ JOBS = Path.home() / ".claude" / "jobs"
 TRANSCRIPTS = Path.home() / ".claude" / "projects"
 # Local state and config.toml.
 CONFIG = Path(os.environ.get("TAVLA_HOME", Path.home() / ".config" / "tavla"))
-# The four below are set from config.toml by load_config().
+# The ones below are set from config.toml by load_config().
 # Projects whose Status field places a card, in precedence order. Non-Done items of a
 # backlog project become cards even when no session or assignment points at them.
 PROJECTS: list[dict] = []
@@ -36,6 +36,8 @@ THEME = "tavla"
 # The terminal app `attach` opens tabs in.
 TERMINALS = {"iterm2": "iTerm2", "ghostty": "Ghostty"}
 TERMINAL = "ghostty" if os.environ.get("TERM_PROGRAM") == "ghostty" else "iterm2"
+# How long a finished session on no card stays listed under Unlinked.
+UNLINKED_DAYS: float = 10
 PROJECT_TTL_S = 300
 ASSIGNED_TTL_S = 300  # open issues assigned to me
 META_TTL_S = 600  # issue/PR metadata: labels, sub-issues, linked PRs, open state
@@ -106,6 +108,8 @@ RECENT_S = 3 * 86_400
 NEEDS = {"blocked", "needs_input", "needs-input", "waiting", "review"}
 WORKING = {"working", "running", "starting", "busy"}
 STATUS_COLUMNS = [("todo", "Todo"), ("progress", "In Progress"), ("blocked", "Blocked"), ("done", "Done")]
+# Each project's Status field (project id, field id, options), read once per run: the options hardly ever change.
+STATUS_FIELDS: dict[str, dict] = {}
 # Not-started statuses share the Todo column; a card keeps its own status for display.
 # Statuses a new session may move to In Progress.
 NOT_STARTED = ("Todo", "Backlog")
@@ -121,8 +125,8 @@ Ref = tuple[str, str, int]
 
 
 def load_config() -> None:
-    """Set PROJECTS, ISSUE_REPOS, SESSION_CWD, THEME and TERMINAL from CONFIG/config.toml; a missing file leaves the defaults."""
-    global PROJECTS, ISSUE_REPOS, SESSION_CWD, THEME, TERMINAL
+    """Set PROJECTS, ISSUE_REPOS, SESSION_CWD, THEME, TERMINAL and UNLINKED_DAYS from CONFIG/config.toml; a missing file leaves the defaults."""
+    global PROJECTS, ISSUE_REPOS, SESSION_CWD, THEME, TERMINAL, UNLINKED_DAYS
     path = CONFIG / "config.toml"
     try:
         cfg = tomllib.loads(path.read_text())
@@ -144,7 +148,10 @@ def load_config() -> None:
     terminal = str(cfg.get("terminal") or TERMINAL).lower()
     if terminal not in TERMINALS:
         raise ValueError(f"{path}: terminal must be one of {', '.join(TERMINALS)}, got {terminal!r}")
-    PROJECTS, ISSUE_REPOS, TERMINAL = projects, repos, terminal
+    days = cfg.get("unlinked_days", UNLINKED_DAYS)
+    if isinstance(days, bool) or not isinstance(days, (int, float)) or days < 0:
+        raise ValueError(f"{path}: unlinked_days must be a number of days, 0 or more, got {days!r}")
+    PROJECTS, ISSUE_REPOS, TERMINAL, UNLINKED_DAYS = projects, repos, terminal, days
     if cfg.get("session_dir"):
         SESSION_CWD = Path(str(cfg["session_dir"])).expanduser()
     THEME = str(cfg.get("theme") or THEME)
@@ -856,12 +863,15 @@ def _build_board(force: bool, offline: bool) -> dict:
     for i in assigned:
         add_issue(f"{i['repository']['nameWithOwner']}#{i['number']}".lower(), i["title"], i["url"], True, parse_time_ms(i.get("updatedAt")), True)
     status_of: dict[str, str] = {}
-    status_item: dict[str, dict] = {}  # the project item that status came from, for start_progress
+    status_item: dict[str, dict] = {}  # the project item that status came from, for set_status
+    unset_item: dict[str, dict] = {}  # with no status on any project, the first project the issue is on
     for it in project_items:
         if it["status"] and it["key"] not in status_of:
             status_of[it["key"]] = it["status"]
             if it.get("itemId"):
                 status_item[it["key"]] = {"project": it["project"], "itemId": it["itemId"]}
+        elif not it["status"] and it.get("itemId"):
+            unset_item.setdefault(it["key"], {"project": it["project"], "itemId": it["itemId"]})
         if it["isBacklog"] and it["status"] != "Done":
             add_issue(it["key"], it["title"], it["url"], True, 0, True)
 
@@ -922,7 +932,7 @@ def _build_board(force: bool, offline: bool) -> dict:
                 "isOpen": iss["isOpen"],
                 "status": status if iss["isOpen"] else "Closed",
                 "statusColumn": status_column,
-                "statusItem": status_item.get(key),
+                "statusItem": status_item.get(key) or unset_item.get(key),
                 "sessionColumn": session_column,
                 "searchOnly": search_only or sprint_filtered,
                 "sprint": sprint,
@@ -943,8 +953,9 @@ def _build_board(force: bool, offline: bool) -> dict:
     cards.sort(key=lambda c: (liveness.get(c["sessionColumn"], 2), -c["updatedAt"]))
     # Unlinked means on no card: no issue found, or its issue has no card (e.g. GitHub couldn't be asked).
     on_card = {c["key"] for c in cards}
+    unlinked_since = now_ms() - UNLINKED_DAYS * 86_400_000
     unlinked = sorted(
-        (s for s in sessions if not on_card.intersection(s["issues"]) and (s["kind"] != "idle" or s["updatedAt"] >= recent)),
+        (s for s in sessions if not on_card.intersection(s["issues"]) and (s["kind"] != "idle" or s["updatedAt"] >= unlinked_since)),
         key=lambda s: -s["updatedAt"],
     )
     return {"cards": cards, "unlinked": unlinked, "sprints": sprints, "fetchedAt": now_ms(), "errors": errors, "isOffline": False}
@@ -1038,11 +1049,27 @@ def summary(board: dict, grouping: str) -> str:
 
 # --- actions -----------------------------------------------------------------
 
+# Given the tty of a tab already attached to the session, brings that tab forward instead of opening one.
 ITERM_SCRIPT = """
 on run argv
   set cmd to item 1 of argv
+  set ttyPath to item 2 of argv
   tell application "iTerm2"
     activate
+    if ttyPath is not "" then
+      repeat with w in windows
+        repeat with t in tabs of w
+          repeat with s in sessions of t
+            if tty of s is ttyPath then
+              select w
+              tell t to select
+              tell s to select
+              return "focused"
+            end if
+          end repeat
+        end repeat
+      end repeat
+    end if
     if (count of windows) = 0 then
       set s to current session of (create window with default profile)
     else
@@ -1050,6 +1077,7 @@ on run argv
       set s to current session of t
     end if
     tell s to write text cmd
+    return "opened"
   end tell
 end run
 """
@@ -1073,8 +1101,25 @@ end run
 """
 
 
+def attached_tty(session_id: str) -> str:
+    """The tty of a terminal running `claude attach <session_id>`, or "" when none does."""
+    try:
+        out = run(["ps", "-ax", "-o", "tty=,command="])
+    except RuntimeError:
+        return ""
+    for line in out.splitlines():
+        tty, _, command = line.strip().partition(" ")
+        argv = command.split()
+        if len(argv) == 3 and Path(argv[0]).name == "claude" and argv[1:] == ["attach", session_id] and tty.startswith("tty"):
+            return f"/dev/{tty}"
+    return ""
+
+
 def attach(session_id: str, title: str = "", dry_run: bool = False, cwd: str = "") -> str:
     """Open a new tab in TERMINAL attached to the session; detaching leaves the tab's shell open.
+
+    Returns the command the new tab runs, or "" when an iTerm2 tab already attached to the session
+    was brought forward instead: that tab is found by the tty its `claude attach` runs on.
 
     The tab closes itself once the session is deleted: `claude attach` returns when its session is
     removed, and the shell then exits because the job directory is gone.
@@ -1086,10 +1131,12 @@ def attach(session_id: str, title: str = "", dry_run: bool = False, cwd: str = "
     and gets the name as a tab name override instead."""
     name = shlex.quote(title or session_id)
     cmd = f"printf '\\033]1;%s\\007' {name} && cd {shlex.quote(cwd or str(SESSION_CWD))} && CLAUDE_CODE_DISABLE_TERMINAL_TITLE=1 claude attach {session_id}; [ -d {shlex.quote(str(JOBS / session_id))} ] || exit"
-    argv = ["osascript", "-e", GHOSTTY_SCRIPT, cmd, title or session_id] if TERMINAL == "ghostty" else ["osascript", "-e", ITERM_SCRIPT, cmd]
-    if not dry_run:
-        run(argv, timeout=20)
-    return cmd
+    if dry_run:
+        return cmd
+    if TERMINAL == "ghostty":
+        run(["osascript", "-e", GHOSTTY_SCRIPT, cmd, title or session_id], timeout=20)
+        return cmd
+    return "" if run(["osascript", "-e", ITERM_SCRIPT, cmd, attached_tty(session_id)], timeout=20).strip() == "focused" else cmd
 
 
 def new_session(target: str, prompt: str = "", title: str = "") -> str:
@@ -1146,24 +1193,45 @@ def create_issue(repo: str, title: str, body: str = "", assign: bool = True) -> 
     return {"key": key_of((m[1], m[2], int(m[3]))), "url": url, "title": issue["title"]}
 
 
+def status_field(project: str) -> dict:
+    """The Status field of a project (owner/number): the project's id, the field's id and its options."""
+    if project not in STATUS_FIELDS:
+        owner, number = project.split("/")
+        proj = ((graphql(STATUS_FIELD_QUERY, {"owner": owner, "number": int(number)}).get("data") or {}).get("repositoryOwner") or {}).get("projectV2") or {}
+        field = proj.get("field") or {}
+        if not proj.get("id") or not field.get("id") or not field.get("options"):
+            raise RuntimeError(f"project {project} has no Status field")
+        STATUS_FIELDS[project] = {"project": proj["id"], "field": field["id"], "options": field["options"]}
+    return STATUS_FIELDS[project]
+
+
+def set_status(card: dict, name: str) -> str:
+    """Set a card's status, on the project its status came from, to the option of that name (case ignored).
+
+    Returns the option's own name. The cached project list is patched, so the next refresh shows
+    the change without refetching."""
+    item = card.get("statusItem")
+    if not item:
+        raise RuntimeError(f"{card['key']} is on none of the configured projects")
+    field = status_field(item["project"])
+    option = next((o for o in field["options"] if o["name"].lower() == name.lower()), None)
+    if not option:
+        raise RuntimeError(f"project {item['project']} has no Status option {name}")
+    body = graphql(SET_STATUS_MUTATION, {"project": field["project"], "item": item["itemId"], "field": field["field"], "option": option["id"]})
+    if not ((body.get("data") or {}).get("updateProjectV2ItemFieldValue") or {}).get("projectV2Item"):
+        STATUS_FIELDS.pop(item["project"], None)  # the options may have changed since they were read
+        raise RuntimeError(f"status not changed: {first_error(body)}")
+    patch_projects_cache(item["itemId"], {"status": option["name"]})
+    return option["name"]
+
+
 def start_progress(card: dict) -> bool:
     """Move a card whose status is Todo or Backlog to In Progress, on the project its status came from.
 
-    False when there is nothing to move: another status, or no project item recorded for it. The
-    cached project list is patched, so the next refresh shows the move without refetching."""
-    item = card.get("statusItem")
-    if card.get("status") not in NOT_STARTED or not item:
+    False when there is nothing to move: another status, or no project item recorded for it."""
+    if card.get("status") not in NOT_STARTED or not card.get("statusItem"):
         return False
-    owner, number = item["project"].split("/")
-    proj = ((graphql(STATUS_FIELD_QUERY, {"owner": owner, "number": int(number)}).get("data") or {}).get("repositoryOwner") or {}).get("projectV2") or {}
-    field = proj.get("field") or {}
-    option = next((o for o in field.get("options") or [] if o["name"].lower() == "in progress"), None)
-    if not proj.get("id") or not field.get("id") or not option:
-        raise RuntimeError(f"project {item['project']} has no Status option In Progress")
-    body = graphql(SET_STATUS_MUTATION, {"project": proj["id"], "item": item["itemId"], "field": field["id"], "option": option["id"]})
-    if not ((body.get("data") or {}).get("updateProjectV2ItemFieldValue") or {}).get("projectV2Item"):
-        raise RuntimeError(f"status not changed: {first_error(body)}")
-    patch_projects_cache(item["itemId"], {"status": option["name"]})
+    set_status(card, "In Progress")
     return True
 
 
@@ -1402,7 +1470,7 @@ def main(argv: list[str] | None = None) -> int:
             s = resolve_session(a.session)
             if s["isInteractive"]:
                 raise ValueError(f"{s['id']} is an interactive session running in its own terminal; only background sessions attach")
-            print(attach(s["id"], s["name"], a.dry_run, s["cwd"]))
+            print(attach(s["id"], s["name"], a.dry_run, s["cwd"]) or f"switched to the tab already attached to {s['id']}")
         elif a.cmd == "new":
             print(new_session(a.issue, " ".join(a.prompt)))
         elif a.cmd == "start":
