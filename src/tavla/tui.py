@@ -20,7 +20,8 @@ from textual.containers import Horizontal, HorizontalScroll, Vertical, VerticalS
 from textual.markup import escape
 from textual.screen import ModalScreen
 from textual.theme import Theme
-from textual.widgets import Checkbox, Footer, Input, Label, Link, ListItem, ListView, Markdown, RadioButton, RadioSet, Rule, Static, TextArea
+from textual.widgets import Checkbox, Footer, Input, Label, Link, ListItem, ListView, Markdown, OptionList, RadioButton, RadioSet, Rule, Static, TextArea
+from textual.widgets.option_list import Option
 
 from . import board as core
 
@@ -638,7 +639,63 @@ class StopOrDelete(ModalScreen[str | None]):
         self.dismiss(None)
 
 
-BOARD_ACTIONS = {"search", "attach", "new", "new_unlinked", "new_issue", "open", "link", "unlink", "stop_delete", "hide", "show_hidden", "show_outside", "group", "view", "parent", "refresh", "back"}
+class PickStatus(ModalScreen[str | None]):
+    """The Status options of a card's project: a number key picks one at once, or enter on the highlighted one."""
+
+    BINDINGS: ClassVar[list[BindingType]] = [Binding("escape", "cancel", "Cancel"), *(Binding(str(n), f"pick({n})", f"Status {n}", show=False) for n in range(1, 10))]
+
+    def __init__(self, card: dict) -> None:
+        super().__init__()
+        self.card = card
+        self.names: list[str] = []
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="ask"):
+            yield Label(f"Status of {self.card['key']}  [$text-muted]a number or enter picks · esc cancels[/]")
+            yield Label("[$text-muted]reading the project's statuses…[/]", id="statuses-loading")
+            yield OptionList(id="statuses")
+
+    def on_mount(self) -> None:
+        self.load()
+
+    @work(thread=True)
+    def load(self) -> None:
+        try:
+            names = [o["name"] for o in core.status_field(self.card["statusItem"]["project"])["options"]]
+        except Exception as err:  # noqa: BLE001
+            self.app.call_from_thread(self.failed, err)
+            return
+        self.app.call_from_thread(self.show_options, names)
+
+    def failed(self, err: Exception) -> None:
+        if self.is_attached:
+            self.app.notify(f"Could not read the statuses: {err}", severity="error")
+            self.dismiss(None)
+
+    def show_options(self, names: list[str]) -> None:
+        if not self.is_attached:
+            return
+        self.names = names
+        current = self.card["status"].lower()
+        self.query_one("#statuses-loading").display = False
+        options = self.query_one("#statuses", OptionList)
+        options.add_options(Option(f"[b]{n if n < 10 else ' '}[/]  {escape(name)}{'  [$text-muted]current[/]' if name.lower() == current else ''}") for n, name in enumerate(names, 1))
+        options.highlighted = next((i for i, name in enumerate(names) if name.lower() == current), 0)
+        options.focus()
+
+    @on(OptionList.OptionSelected)
+    def selected(self, event: OptionList.OptionSelected) -> None:
+        self.dismiss(self.names[event.option_index])
+
+    def action_pick(self, number: int) -> None:
+        if number <= len(self.names):
+            self.dismiss(self.names[number - 1])
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+BOARD_ACTIONS = {"search", "attach", "new", "new_unlinked", "new_issue", "open", "status", "link", "unlink", "stop_delete", "hide", "show_hidden", "show_outside", "group", "view", "parent", "refresh", "back"}  # fmt: skip
 
 
 CARD_CSS = """
@@ -739,7 +796,9 @@ class BoardApp(App):
     #detail-sessions {{ width: 1fr; height: 1fr; background: $boost; border: round $panel; }}
     #detail-sessions:focus-within {{ border: round $accent; }}
     #ask {{ width: 80; height: auto; padding: 1 2; border: round $accent; background: $surface; }}
-    Ask, AskPrompt, NewIssue, StopOrDelete {{ align: center middle; }}
+    Ask, AskPrompt, NewIssue, StopOrDelete, PickStatus {{ align: center middle; }}
+    #statuses {{ height: auto; max-height: 14; margin-top: 1; padding: 0; border: none; background: transparent; }}
+    #statuses-loading {{ margin-top: 1; }}
     #prompt {{ height: auto; min-height: 3; max-height: 12; }}
     #ask RadioSet, #ask Checkbox {{ width: 1fr; margin-top: 1; }}
     #ask TextArea {{ height: 8; }}
@@ -754,8 +813,9 @@ class BoardApp(App):
         Binding("N", "new_unlinked", "New unlinked session", show=False),
         Binding("i", "new_issue", "New issue"),
         Binding("o", "open", "Open issue"),
+        Binding("u", "status", "Status"),
         Binding("l", "link", "Link session"),
-        Binding("u", "unlink", "Unlink", show=False),
+        Binding("U", "unlink", "Unlink", show=False),
         Binding("ctrl+x", "stop_delete", "Stop/delete", show=False),
         Binding("h", "hide", "Hide/unhide"),
         Binding("H", "show_hidden", "Show hidden", show=False),
@@ -1182,8 +1242,9 @@ class BoardApp(App):
             self.call_from_thread(self.notify, f"{sess['name']} is interactive and already runs in its own terminal.", severity="warning")
             return
         try:
-            core.attach(sess["id"], sess["name"], cwd=sess.get("cwd") or "")
-            self.call_from_thread(self.notify, f"Attached {sess['id']} in a new {core.TERMINALS[core.TERMINAL]} tab")
+            opened = core.attach(sess["id"], sess["name"], cwd=sess.get("cwd") or "")
+            where = "a new" if opened else "its existing"
+            self.call_from_thread(self.notify, f"Attached {sess['id']} in {where} {core.TERMINALS[core.TERMINAL]} tab")
         except Exception as err:  # noqa: BLE001
             self.call_from_thread(self.notify, f"Attach failed: {err}", severity="error")
 
@@ -1362,6 +1423,32 @@ class BoardApp(App):
 
         question = f"Created {issue['key']}. Start a session on it and attach?  [$text-muted]esc skips[/]"
         self.push_screen(AskPrompt(question), go)
+
+    def action_status(self) -> None:
+        card = self.current if self.current and "sessions" in self.current else None
+        if not card:
+            self.notify("Select an issue first.")
+            return
+        if not card.get("statusItem"):
+            why = "is closed" if not card["isOpen"] else "is on none of the projects in config.toml"
+            self.notify(f"{card['key']} {why}, so it has no status to change.", severity="warning")
+            return
+
+        def go(name: str | None) -> None:
+            if name and name.lower() != card["status"].lower():
+                self.set_status(card, name)
+
+        self.push_screen(PickStatus(card), go)
+
+    @work(thread=True)
+    def set_status(self, card: dict, name: str) -> None:
+        try:
+            core.set_status(card, name)
+        except Exception as err:  # noqa: BLE001
+            self.call_from_thread(self.notify, f"Could not change the status of {card['key']}: {err}", severity="error")
+            return
+        self.call_from_thread(self.notify, f"{card['key']}: {card['status'] or 'No status'} → {name}")
+        self.call_from_thread(self.action_refresh)
 
     def action_link(self) -> None:
         sess = self.acting_session()
