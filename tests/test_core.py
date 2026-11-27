@@ -1233,6 +1233,20 @@ def test_filter_matches_every_word_across_title_ref_status_labels_and_sessions()
     assert core.matches(side, "question") and core.matches(side, "cccc") and not core.matches(side, "flaky")
 
 
+def test_filter_matches_a_board_issue_on_anything_in_its_subtree_but_not_on_a_hidden_sub_issue(plan, monkeypatch):
+    monkeypatch.setitem(SUB_ISSUES, "acme/infra#40", ["acme/tools#41", "acme/infra#7"])  # the flaky deploy, labelled and blocked, two levels down
+    core.link("cccc3333", "acme/tools#41")  # "random question", two levels down
+    board = core.build_board()
+    cards = {c["key"]: c for c in board["cards"]}
+    for query in ("Issue 41", "tools#41", "acme/tools#41", "tools#42", "random question", "fix flaky", "p1", "blocked", "rotated closed"):
+        assert [k for k, c in cards.items() if core.matches(c, query)] == ["acme/infra#9"], query
+    plan = cards["acme/infra#9"]
+    assert not core.matches(plan, "tools#41", hidden={"acme/infra#40"})  # hiding a sub-issue leaves out everything under it too
+    assert not core.matches(plan, "tools#42", hidden={"acme/tools#41"}) and core.matches(plan, "tools#42", hidden={"acme/infra#11"})
+    # A sub-issue shows no parent line, so its parent doesn't match it: inside acme/infra#9 the title of #9 finds no sub-issue.
+    assert not core.matches(tree_card(board, "acme/infra#9", "acme/infra#11"), "untouched") and not core.matches(plan, "rollouts")
+
+
 def test_tui_slash_filters_board_and_list_then_enter_selects_and_esc_clears(lone_todo):
     from tavla import tui
 
@@ -1277,6 +1291,87 @@ def test_tui_slash_filters_board_and_list_then_enter_selects_and_esc_clears(lone
             await pilot.press("v")
             await pilot.pause()
             assert keys("todo") == all_todo
+
+    asyncio.run(scenario())
+
+
+def test_tui_a_search_shows_the_board_issue_over_a_deep_match_and_stays_on_while_opening_down_to_it_and_going_back_up(plan):
+    from tavla import tui
+
+    core.link("cccc3333", "acme/tools#42")  # three levels down
+
+    async def scenario():
+        app = tui.BoardApp()
+        async with app.run_test(size=(190, 50)) as pilot:
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+
+            def status():
+                return str(app.query_one("#status").content)
+
+            await pilot.press("slash", *"tools#42")
+            await pilot.pause()
+            assert shown(app) == {"todo": ["acme/infra#9"], "progress": [], "blocked": [], "done": [], "unlinked": []}
+            assert "1 of 4 issues" in status()  # the search-only card counts: the search reaches it
+            await pilot.press("enter")  # to the first match
+            await pilot.pause()
+            assert app.current_key() == "card:acme/infra#9"
+            await pilot.press("enter")  # each level shows only the issue on the way down
+            await pilot.pause()
+            assert shown(app) == {"todo": ["acme/infra#40"], "progress": [], "blocked": [], "done": []} and "1 of 3 issues" in status()
+            await pilot.press("enter")
+            await pilot.pause()
+            assert shown(app)["todo"] == ["acme/tools#41"] and "1 of 1 issue" in status()
+            await pilot.press("enter")
+            await pilot.pause()
+            assert app.current_key() == "card:acme/tools#42"
+            await pilot.press("escape", "escape")  # back up, the filter still on
+            await pilot.pause()
+            assert shown(app)["todo"] == ["acme/infra#40"] and app.filter == "tools#42" and "1 of 3 issues" in status()
+            await pilot.press("escape")
+            await pilot.pause()
+            assert shown(app)["todo"] == ["acme/infra#9"] and app.current_key() == "card:acme/infra#9"
+
+            await pilot.press("slash", "escape", "enter")  # cleared, then a search inside acme/infra#9 covers only its subtree
+            await pilot.pause()
+            await pilot.press("slash", *"flaky")
+            await pilot.pause()
+            assert shown(app) == {"todo": [], "progress": [], "blocked": [], "done": []} and "0 of 3 issues" in status()
+            await pilot.press("backspace", "backspace", "backspace", "backspace", "backspace", *"tools")
+            await pilot.pause()
+            assert shown(app)["todo"] == ["acme/infra#40"]
+
+            # A match on the board issue alone: its sub-issues don't match on their parent, so opening it shows none, and esc goes back.
+            await pilot.press("escape", "escape", "slash", *"infra#9", "enter", "enter")
+            await pilot.pause()
+            assert app.path == ["acme/infra#9"] and shown(app) == {"todo": [], "progress": [], "blocked": [], "done": []}
+            await pilot.press("escape")
+            await pilot.pause()
+            assert app.path == [] and shown(app)["todo"] == ["acme/infra#9"]
+
+    asyncio.run(scenario())
+
+
+def test_tui_a_search_leaves_out_a_hidden_sub_issue_unless_hidden_issues_are_shown(plan):
+    from tavla import tui
+
+    async def scenario():
+        app = tui.BoardApp()
+        async with app.run_test(size=(190, 50)) as pilot:
+            await app.workers.wait_for_complete()
+            await select_card(app, pilot, "acme/infra#9")
+            await pilot.press("enter")
+            await select_card(app, pilot, "acme/infra#40")
+            await pilot.press("h", "slash", *"acme/infra")
+            await pilot.pause()
+            assert "2 of 2 issues" in str(app.query_one("#status").content)  # a hidden issue the search can't reach doesn't count
+            await pilot.press("escape", "escape")  # the filter cleared, and back on the board
+            await pilot.press("H", "slash", *"tools#42")
+            await pilot.pause()
+            assert shown(app)["todo"] == ["acme/infra#9"]
+            await pilot.press("enter", "H")
+            await pilot.pause()
+            assert shown(app)["todo"] == [] and "0 of" in str(app.query_one("#status").content)
 
     asyncio.run(scenario())
 

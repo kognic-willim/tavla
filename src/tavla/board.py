@@ -14,6 +14,7 @@ import subprocess
 import sys
 import time
 import tomllib
+from collections.abc import Collection
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import suppress
 from datetime import date, timedelta
@@ -465,21 +466,27 @@ def find_sessions(sessions: list[dict], needle: str) -> list[dict]:
     return exact or [s for s in sessions if s["id"].startswith(n) or n in s["name"].lower()]
 
 
-def search_text(row: dict) -> str:
-    """What a filter matches on: a card's title, repo#N, status, labels, parent issue (title and repo#N) and session names; a session's name, id and refs."""
-    if "sessions" in row:
-        names = [s["name"] for s in [*row["sessions"], *row.get("pastSessions", [])]]
-        parent = row.get("parent") or {}
-        up = [parent["title"], parent["key"], parent["key"].split("/", 1)[1]] if parent else []
-        parts = [row["title"], row["key"], row["key"].split("/", 1)[1], row["status"], *(lb["name"] for lb in row.get("labels") or []), *up, *names]
-    else:
-        parts = [row["name"], row["id"], *row.get("refs", [])]
+def search_text(row: dict, hidden: Collection[str] = ()) -> str:
+    """What a filter matches on. A card: the title, repo#N, status, labels and session names of the card and of every
+    issue in its subtree, leaving out a hidden sub-issue and everything under it, plus the parent issue (title and
+    repo#N) where the card shows it, on a board issue. A session: its name, id and refs."""
+    if "sessions" not in row:
+        return " ".join(p for p in [row["name"], row["id"], *row.get("refs", [])] if p).lower()
+    parent = (row.get("parent") or {}) if row.get("isBoardIssue") else {}
+    parts = [parent["title"], parent["key"], parent["key"].split("/", 1)[1]] if parent else []
+    todo = [row]
+    while todo:
+        card = todo.pop()
+        names = [s["name"] for s in [*card["sessions"], *card.get("pastSessions", [])]]
+        parts += [card["title"], card["key"], card["key"].split("/", 1)[1], card["status"], *(lb["name"] for lb in card.get("labels") or []), *names]
+        todo += [sub for sub in card.get("subtree") or [] if sub["key"] not in hidden]
     return " ".join(p for p in parts if p).lower()
 
 
-def matches(row: dict, query: str) -> bool:
-    """Every whitespace-separated word of the query appears somewhere in the row, ignoring case."""
-    text = search_text(row)
+def matches(row: dict, query: str, hidden: Collection[str] = ()) -> bool:
+    """Every whitespace-separated word of the query appears somewhere in the row, ignoring case; hidden holds the
+    sub-issues to leave out."""
+    text = search_text(row, hidden)
     return all(word in text for word in query.lower().split())
 
 
