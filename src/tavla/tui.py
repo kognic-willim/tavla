@@ -909,7 +909,13 @@ class BoardApp(App):
         try:
             data = core.build_board(force)
         except Exception as err:  # noqa: BLE001
-            data = {**self.data, "errors": [str(err)]}
+            data = {**self.data, "errors": [str(err)], "moved": []}
+        else:
+            # The one write a refresh makes: my Todo issues that an open PR closes go to In Progress.
+            try:
+                data["moved"] = core.move_issues_with_open_prs(data)
+            except Exception as err:  # noqa: BLE001
+                data["errors"].append(f"could not move the issues with an open PR to In Progress: {err}")
         self.call_from_thread(self.apply, data)
 
     async def show_board(self, data: dict) -> None:
@@ -950,6 +956,8 @@ class BoardApp(App):
         if n_hidden := sum(1 for c in cards if c["key"] in self.hidden):
             group += f"  ·  {n_hidden} hidden ({'shown, ' if self.show_hidden else ''}H toggles)"
         group += self.sprint_status()
+        if d.get("moved"):
+            group += f"  ·  [$success]moved {escape(', '.join(d['moved']))} to In Progress[/]"
         errors = f"  ·  [$error]{len(d['errors'])} error(s): {escape(fit(d['errors'][0], 90))}[/]" if d["errors"] else ""
         self.query_one("#status", Static).update(f"{group}  ·  {state}{errors}")
         self.update_crumb()
@@ -1427,7 +1435,8 @@ class BoardApp(App):
         self.call_from_thread(self.action_refresh)
         if progress:
             try:
-                core.start_progress(card)
+                if core.start_progress(card):
+                    self.moved_along(card, "In Progress")
                 self.call_from_thread(self.action_refresh)
             except Exception as err:  # noqa: BLE001
                 self.call_from_thread(self.notify, f"Started, but could not move {card['key']} to In Progress: {err}", severity="error")
@@ -1533,7 +1542,20 @@ class BoardApp(App):
             self.call_from_thread(self.notify, f"Could not change the status of {card['key']}: {err}", severity="error")
             return
         self.call_from_thread(self.notify, f"{card['key']}: {card['status'] or 'No status'} → {name}")
+        self.moved_along(card, name)
         self.call_from_thread(self.action_refresh)
+
+    def moved_along(self, card: dict, name: str) -> None:
+        """From a worker, after the card's status was set to name: In Progress takes its ancestors still in Todo along."""
+        up: list[str] = []
+        try:
+            _, errors = core.move_ancestors(self.data, card["key"], name, up)
+        except Exception as err:  # noqa: BLE001
+            errors = [f"could not move the issues above {card['key']} to In Progress: {err}"]
+        if up:
+            self.call_from_thread(self.notify, f"Moved {', '.join(up)} to In Progress along with {card['key']}")
+        for err in errors:
+            self.call_from_thread(self.notify, err[0].upper() + err[1:], severity="error")
 
     def action_link(self) -> None:
         sess = self.acting_session()

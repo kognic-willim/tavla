@@ -105,6 +105,8 @@ SUB_ISSUES: dict[str, list[str | None]] = {"acme/infra#9": ["acme/infra#11"]}
 PULLS: dict[str, dict] = {"acme/charts#40": {"state": "MERGED", "closes": ["acme/charts#3"]}}
 TITLES = {"acme/infra#7": "Deploy is flaky", "acme/charts#3": "Upgrade chart"}
 ASSIGNEES: dict[str, list[str]] = {}
+# The PRs that close an issue, as (number, state), besides the open one acme/infra#7 always has.
+CLOSING_PRS: dict[str, list[tuple[int, str]]] = {}
 UNREADABLE: set[str] = set()  # refs GitHub answers null for: deleted, or no access
 
 
@@ -164,7 +166,12 @@ def fake_graphql(query, variables=None):
             node |= {
                 "labels": {"nodes": [{"name": "bug [p1]", "color": "d73a4a"}] if rich else []},
                 "assignees": {"nodes": [{"login": a} for a in ASSIGNEES.get(key, [])]},
-                "closedByPullRequestsReferences": {"nodes": [{"number": 50, "state": "OPEN", "url": f"https://github.com/{r}/pull/50", "repository": {"nameWithOwner": r}}] if rich else []},
+                "closedByPullRequestsReferences": {
+                    "nodes": [
+                        {"number": pn, "state": ps, "url": f"https://github.com/{r}/pull/{pn}", "repository": {"nameWithOwner": r}}
+                        for pn, ps in [*([(50, "OPEN")] if rich else []), *CLOSING_PRS.get(key, [])]
+                    ]
+                },
                 "subIssues": {
                     "totalCount": len(subs),
                     "nodes": [None if s is None else {"number": int(s.split("#")[1]), "repository": {"nameWithOwner": s.split("#")[0]}} for s in subs[:100] if s != "omitted"],
@@ -967,6 +974,207 @@ def test_an_issue_with_no_status_takes_one_on_the_first_project_it_is_on(monkeyp
     monkeypatch.setitem(PROJECTS, "team", [item("acme/infra", 11, "Personal todo", "Blocked")])
     card = every_card(core.build_board(force=True))["acme/infra#11"]
     assert (card["status"], card["statusItem"]) == ("Blocked", {"project": "team/23", "itemId": "PVTI_11"})
+
+
+@pytest.fixture
+def chain(monkeypatch):
+    """acme/infra#9 (Todo on team) > #40 (Todo on extra) > #41 (Blocked on team) > #42 (Todo on me); #11 is a board issue of its own."""
+    monkeypatch.delitem(PARENTS, "acme/infra#11")
+    monkeypatch.setitem(SUB_ISSUES, "acme/infra#9", ["acme/infra#40"])
+    monkeypatch.setitem(SUB_ISSUES, "acme/infra#40", ["acme/infra#41"])
+    monkeypatch.setitem(SUB_ISSUES, "acme/infra#41", ["acme/infra#42"])
+    monkeypatch.setitem(PROJECTS, "team", [*PROJECTS["team"], item("acme/infra", 9, "Assigned but untouched", "Todo"), item("acme/infra", 41, "Issue 41", "Blocked")])
+    monkeypatch.setitem(PROJECTS, "extra", [item("acme/infra", 40, "Issue 40", "Todo")])
+    monkeypatch.setitem(PROJECTS, "me", [*PROJECTS["me"], item("acme/infra", 42, "Issue 42", "Todo")])
+
+
+def progress(project, number):
+    """The status write that moves project item PVTI_<number> to In Progress."""
+    return {"project": f"PVT_{project}", "item": f"PVTI_{number}", "field": "PVTSSF_status", "option": "opt-progress"}
+
+
+CHAIN = ["acme/infra#9", "acme/infra#40", "acme/infra#41", "acme/infra#42"]
+
+
+def test_in_progress_on_a_sub_issue_moves_its_todo_ancestors_on_their_own_projects_and_leaves_a_blocked_one(chain):
+    board = core.build_board()
+    assert core.move_ancestors(board, "acme/infra#42", "Blocked") == ([], [])  # only starting work travels upward
+    assert STATUS_SETS == []
+    assert core.move_ancestors(board, "acme/infra#42", "In progress") == (["acme/infra#40", "acme/infra#9"], [])
+    assert STATUS_SETS == [progress("extra", 40), progress("team", 9)]
+    cards = every_card(core.build_board())
+    assert [cards[k]["status"] for k in CHAIN] == ["In progress", "In progress", "Blocked", "Todo"]
+
+
+@pytest.fixture
+def opened_prs(chain, monkeypatch):
+    """A draft PR is open on my acme/infra#42 and on someone else's #40; my #11 has only a merged PR and a session's PR that closes nothing."""
+    monkeypatch.setitem(ASSIGNEES, "acme/infra#42", ["me"])
+    monkeypatch.setitem(CLOSING_PRS, "acme/infra#42", [(60, "OPEN")])
+    monkeypatch.setitem(ASSIGNEES, "acme/infra#40", ["octocat"])
+    monkeypatch.setitem(CLOSING_PRS, "acme/infra#40", [(61, "OPEN")])
+    monkeypatch.setitem(ASSIGNEES, "acme/infra#11", ["Me"])
+    monkeypatch.setitem(CLOSING_PRS, "acme/infra#11", [(62, "MERGED")])
+    monkeypatch.setitem(PULLS, "acme/infra#64", {"state": "OPEN", "closes": []})
+    job = core.JOBS / "ffff6666"
+    job.mkdir()
+    children = [{"kind": "pr", "href": "https://github.com/acme/infra/pull/64"}]
+    (job / "state.json").write_text(json.dumps({"name": "side work", "state": "working", "intent": "acme/infra#11 tidy", "children": children, "updatedAt": NOW}))
+
+
+def test_my_todo_issue_with_an_open_closing_pr_moves_to_in_progress_with_its_ancestors_once(opened_prs):
+    board = core.build_board()
+    assert STATUS_SETS == []
+    assert core.move_issues_with_open_prs(board) == ["acme/infra#42", "acme/infra#40", "acme/infra#9"]
+    assert STATUS_SETS == [progress("extra", 40), progress("team", 9), progress("me", 42)]  # the ancestors first
+    assert [every_card(board)[k]["statusColumn"] for k in CHAIN] == ["progress", "progress", "blocked", "progress"]  # shown at once
+    cards = every_card(core.build_board())
+    assert [cards[k]["status"] for k in CHAIN] == ["In progress", "In progress", "Blocked", "In progress"]
+    core.set_status(cards["acme/infra#42"], "Todo")  # moved back by hand: it stays there
+    STATUS_SETS.clear()
+    board = core.build_board()
+    assert core.move_issues_with_open_prs(board) == [] and STATUS_SETS == []
+    assert every_card(board)["acme/infra#42"]["status"] == "Todo"
+
+
+def test_printing_the_board_moves_nothing_and_a_refresh_with_nothing_to_move_calls_github_for_nothing_more(opened_prs, capsys):
+    core.build_board()
+    assert core.main(["dump"]) == 0 and core.main(["json"]) == 0
+    assert STATUS_SETS == [] and not (core.CONFIG / "moved.json").exists()
+    assert core.move_issues_with_open_prs(core.build_board()) == ["acme/infra#42", "acme/infra#40", "acme/infra#9"]
+    GRAPHQL_CALLS.clear()
+    assert core.move_issues_with_open_prs(core.build_board()) == [] and GRAPHQL_CALLS == []
+
+
+def test_a_failed_or_paused_automatic_move_is_tried_again_at_the_next_refresh(opened_prs, monkeypatch):
+    def refuse(query, variables=None):
+        if "singleSelectOptionId" in query:
+            return {"errors": [{"message": "no access"}]}
+        return fake_graphql(query, variables)
+
+    monkeypatch.setattr(core, "graphql", refuse)
+    board = core.build_board()
+    assert core.move_issues_with_open_prs(board) == []
+    refused = [f"could not move acme/infra#{n} to In Progress: status not changed: no access" for n in (40, 9, 42)]
+    assert board["errors"][:3] == refused  # first, where the status line shows them
+    assert every_card(board)["acme/infra#42"]["status"] == "Todo"
+    monkeypatch.setattr(core, "graphql", fake_graphql)
+    (core.CONFIG / "backoff.json").write_text(json.dumps({"until": 4_000_000_000}))
+    assert core.move_issues_with_open_prs(core.build_board()) == [] and STATUS_SETS == []  # nothing is sent while GitHub calls are paused
+    (core.CONFIG / "backoff.json").unlink()
+    assert core.move_issues_with_open_prs(core.build_board())[0] == "acme/infra#42"
+
+
+def test_a_rate_limit_while_the_ancestors_move_leaves_the_issue_in_todo_and_the_next_refresh_moves_it_and_them(opened_prs, monkeypatch):
+    def limited(query, variables=None):
+        if "singleSelectOptionId" in query and variables["item"] == "PVTI_9":
+            raise core.RateLimited("graphql: API rate limit exceeded")
+        return fake_graphql(query, variables)
+
+    monkeypatch.setattr(core, "graphql", limited)
+    board = core.build_board()
+    assert core.move_issues_with_open_prs(board) == ["acme/infra#40"]  # moved before the limit hit, so the status line names it
+    assert core.backoff_until() > datetime.now(UTC).timestamp()  # GitHub calls pause
+    assert every_card(board)["acme/infra#42"]["status"] == "Todo" and not (core.CONFIG / "moved.json").exists()
+    monkeypatch.setattr(core, "graphql", fake_graphql)
+    (core.CONFIG / "backoff.json").unlink()
+    STATUS_SETS.clear()
+    assert core.move_issues_with_open_prs(core.build_board()) == ["acme/infra#42", "acme/infra#9"]
+    assert STATUS_SETS == [progress("team", 9), progress("me", 42)]
+
+
+def test_tui_an_issue_with_an_open_closing_pr_is_in_progress_after_the_refresh_and_moved_back_it_stays(lone_todo, monkeypatch):
+    from tavla import tui
+
+    monkeypatch.setitem(ASSIGNEES, "acme/infra#11", ["me"])
+    monkeypatch.setitem(CLOSING_PRS, "acme/infra#11", [(60, "OPEN")])
+
+    async def scenario():
+        app = tui.BoardApp()
+        async with app.run_test(size=(190, 45)) as pilot:
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            assert "acme/infra#11" in shown(app)["progress"]
+            assert "moved acme/infra#11 to In Progress" in str(app.query_one("#status").content)
+            assert STATUS_SETS == [progress("me", 11)]
+            await select_card(app, pilot, "acme/infra#11")
+            await pilot.press("u")
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            await pilot.press("1")  # back to Todo
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            app.action_refresh()
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            assert "acme/infra#11" in shown(app)["todo"] and len(STATUS_SETS) == 2
+            assert "moved" not in str(app.query_one("#status").content)
+
+    asyncio.run(scenario())
+
+
+def test_tui_u_or_n_to_in_progress_on_a_sub_issue_takes_its_todo_ancestors_along(chain, monkeypatch):
+    from tavla import tui
+
+    monkeypatch.setattr(core, "new_session", lambda target, prompt="", title="": "dddd4444")
+
+    async def scenario():
+        app = tui.BoardApp()
+        async with app.run_test(size=(190, 45)) as pilot:
+            await app.workers.wait_for_complete()
+            await select_card(app, pilot, "acme/infra#9")
+            for key in CHAIN[1:]:
+                await pilot.press("enter")
+                await pilot.pause()
+                await select_card(app, pilot, key)
+            await pilot.press("u")
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            await pilot.press("3")  # Blocked: no ancestor moves
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            assert STATUS_SETS == [{**progress("me", 42), "option": "opt-blocked"}]
+            await select_card(app, pilot, "acme/infra#42")
+            await pilot.press("u")
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            await pilot.press("2")
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            assert STATUS_SETS[1:] == [progress("me", 42), progress("extra", 40), progress("team", 9)]
+            assert any("acme/infra#40, acme/infra#9" in str(n.message) for n in app._notifications)
+            assert [every_card(app.data)[k]["status"] for k in CHAIN] == ["In progress", "In progress", "Blocked", "In progress"]
+
+            STATUS_SETS.clear()
+            await select_card(app, pilot, "acme/infra#42")
+            await pilot.press("u")
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            await pilot.press("1")  # and Todo, to start it with n
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            await pilot.press("escape", "escape")  # up to #40, which goes back to Todo too
+            await pilot.pause()
+            await select_card(app, pilot, "acme/infra#40")
+            await pilot.press("u")
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            await pilot.press("1")
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            STATUS_SETS.clear()
+            for key in CHAIN[1:3]:  # down again to #42
+                await select_card(app, pilot, key)
+                await pilot.press("enter")
+                await pilot.pause()
+            await select_card(app, pilot, "acme/infra#42")
+            await pilot.press("n")
+            await pilot.pause()
+            await pilot.press("enter")  # In Progress is ticked on a Todo issue
+            await app.workers.wait_for_complete()
+            assert STATUS_SETS == [progress("me", 42), progress("extra", 40)]  # #9 is in progress already
+
+    asyncio.run(scenario())
 
 
 def test_tui_u_lists_the_project_statuses_and_a_number_or_enter_sets_one(lone_todo, monkeypatch):
